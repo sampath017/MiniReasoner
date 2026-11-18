@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import math
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -19,13 +18,15 @@ class TrainConfig:
     min_learning_rate: float
     weight_decay: float
     eval_every: int
-    eval_windows: int
+    eval_token_fraction: float
     seed: int
 
     def __post_init__(self):
-        if min(self.batch_size, self.steps, self.eval_every, self.eval_windows) < 1:
+        if min(self.batch_size, self.steps, self.eval_every) < 1:
             raise ValueError(
                 "Batch, step, and evaluation counts must be positive")
+        if not 0 < self.eval_token_fraction <= 1:
+            raise ValueError("eval_token_fraction must be greater than zero and at most one")
         if not 0 <= self.warmup_steps < self.steps:
             raise ValueError("Warmup must be shorter than the run")
         if not 0 <= self.min_learning_rate <= self.learning_rate or self.learning_rate == 0:
@@ -49,14 +50,62 @@ class TokenStream:
             self.tokens = np.memmap(
                 stream, dtype=TOKEN_DTYPE, mode="r", shape=(size,))
         self.offsets = np.arange(context + 1)
-        self.windows = (size - 1) // context
-        if self.windows < 1:
-            raise ValueError(f"{path} needs at least {context + 1} tokens")
+        self.context_length = context
+        self.target_count = size - 1
+        self.windows, self.tail_targets = divmod(self.target_count, context)
+        if self.target_count < 1:
+            raise ValueError(f"{path} needs at least two tokens for next-token prediction")
 
     def batch(self, starts: np.ndarray, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        batch = self.tokens[starts[:, None] + self.offsets]
-        ids = torch.from_numpy(batch.astype(np.int64)).to(device)
+        indices = starts[:, None] + self.offsets
+        if indices[:, -1].max() >= len(self.tokens):
+            # Pad the last short window and omit the padded targets from cross-entropy.
+            valid = indices < len(self.tokens)
+            batch = self.tokens[np.minimum(indices, len(self.tokens) - 1)].astype(np.int64)
+            targets = batch[:, 1:].copy()
+            targets[~valid[:, 1:]] = -100
+            return torch.from_numpy(batch[:, :-1].copy()).to(device), torch.from_numpy(targets).to(device)
+        ids = torch.from_numpy(self.tokens[indices].astype(np.int64)).to(device)
         return ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
+
+
+class EpochBatchSampler:
+    def __init__(self, data: TokenStream, batch_size: int, seed: int):
+        self.data = data
+        self.batch_size = batch_size
+        self.seed = seed
+        self.window_count = data.windows + int(data.tail_targets > 0)
+        self.steps_per_epoch = math.ceil(self.window_count / batch_size)
+        self.epoch = -1
+        self.order = np.empty(0, dtype=np.int64)
+
+    def starts(self, step: int) -> np.ndarray:
+        epoch, batch_index = divmod(step - 1, self.steps_per_epoch)
+        if epoch != self.epoch:
+            rng = np.random.default_rng([self.seed, epoch])
+            self.order = rng.permutation(self.data.windows)
+            if self.data.tail_targets:
+                self.order = np.append(self.order, self.data.windows)
+            self.epoch = epoch
+        start = batch_index * self.batch_size
+        return self.order[start:start + self.batch_size] * self.data.context_length
+
+    def targets_through(self, step: int) -> int:
+        epochs, batches = divmod(step, self.steps_per_epoch)
+        return epochs * self.data.target_count + batches * self.batch_size * self.data.context_length
+
+
+def sample_validation_windows(data: TokenStream, config: TrainConfig, step: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return random window starts and the number of targets to score in each."""
+    budget = math.ceil(data.target_count * config.eval_token_fraction)
+    rng = np.random.default_rng([config.seed, step])
+    window_ids = rng.permutation(math.ceil(data.target_count / data.context_length))
+    starts = window_ids * data.context_length
+    lengths = np.minimum(data.context_length, data.target_count - starts)
+    cumulative = lengths.cumsum()
+    last = int(cumulative.searchsorted(budget))
+    lengths[last] -= cumulative[last] - budget
+    return starts[:last + 1], lengths[:last + 1]
 
 
 def require_training_gpu() -> torch.device:
@@ -88,26 +137,19 @@ def loss_for(model, inputs, targets, precision):
 
 
 @torch.inference_mode()
-def evaluate(model, data, config, device, precision) -> float:
+def evaluate(model, data, config, device, precision, *, step: int) -> float:
+    starts, lengths = sample_validation_windows(data, config, step)
     model.eval()
-    count = min(data.windows, config.eval_windows)
-    windows = np.linspace(0, data.windows - 1, num=count, dtype=np.int64)
-    starts = windows * model.config.context_length
-    total = torch.zeros((), device=device)
-    for chunk in range(0, count, config.batch_size):
-        offsets = starts[chunk: chunk + config.batch_size]
-        x, y = data.batch(offsets, device)
-        total += loss_for(model, x, y, precision) * len(offsets)
+    total = torch.zeros((), device=device, dtype=torch.float64)
+    for first in range(0, len(starts), config.batch_size):
+        stop = first + config.batch_size
+        x, y = data.batch(starts[first:stop], device)
+        if stop >= len(starts) and lengths[-1] < data.context_length:
+            y = y.clone()  # A single input and target window can share storage.
+            y[-1, int(lengths[-1]):] = -100
+        total += loss_for(model, x, y, precision).double() * int(lengths[first:stop].sum())
     model.train()
-    return total.item() / count
-
-
-def save_checkpoint(path: Path, state: dict) -> None:
-    with TemporaryDirectory(prefix=".checkpoint-", dir=path.parent) as temporary:
-        staging = Path(temporary) / path.name
-        with staging.open("wb") as stream:
-            torch.save(state, stream)
-        staging.replace(path)
+    return total.item() / int(lengths.sum())
 
 
 def load_checkpoint(path: Path) -> dict:
