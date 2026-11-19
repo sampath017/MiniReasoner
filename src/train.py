@@ -111,9 +111,19 @@ def sample_validation_windows(data: TokenStream, config: TrainConfig, step: int)
 def require_training_gpu() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "Training requires a CUDA GPU. Enable a GPU or set train_model=False for inference."
+            "CUDA training requires a GPU. For a CPU run, choose the small preset and training_device='cpu'."
         )
     return torch.device("cuda")
+
+
+def resolve_training_device(request: str, preset: str) -> torch.device:
+    if request == "cuda":
+        return require_training_gpu()
+    if request != "cpu":
+        raise ValueError("Choose 'cpu' or 'cuda' for training_device.")
+    if preset != "small":
+        raise ValueError("CPU training is available with the small preset.")
+    return torch.device("cpu")
 
 
 def resolve_precision(request: str, device: torch.device) -> str:
@@ -121,6 +131,10 @@ def resolve_precision(request: str, device: torch.device) -> str:
         return "fp32"
     if request not in ("auto", "bf16"):
         raise ValueError("Training precision must be auto, fp32, or bf16")
+    if device.type == "cpu":
+        if request == "bf16":
+            raise ValueError("For CPU training, choose auto or fp32 precision.")
+        return "fp32"
     native_bf16 = torch.cuda.get_device_capability(
         device)[0] >= 8 and torch.cuda.is_bf16_supported()
     if request == "auto":
@@ -131,7 +145,7 @@ def resolve_precision(request: str, device: torch.device) -> str:
 
 
 def loss_for(model, inputs, targets, precision):
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=precision == "bf16"):
+    with torch.autocast(device_type=inputs.device.type, dtype=torch.bfloat16, enabled=precision == "bf16"):
         logits = model(inputs)
         return F.cross_entropy(logits.flatten(0, 1), targets.flatten())
 

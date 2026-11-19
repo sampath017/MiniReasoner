@@ -42,6 +42,8 @@ def _rclone(*args: str, allow_missing: bool = False) -> str:
     result = subprocess.run([executable, *args], capture_output=True, text=True, encoding="utf-8")
     if allow_missing and result.returncode in (3, 4):  # Directory or file absent.
         return ""
+    if result.returncode < 0:
+        raise RuntimeError(f"rclone {args[0]} was interrupted by signal {-result.returncode}.")
     if result.returncode:
         raise RuntimeError(f"rclone {args[0]} failed: {result.stderr.strip()}")
     return result.stdout

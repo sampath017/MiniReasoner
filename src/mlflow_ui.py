@@ -1,4 +1,4 @@
-"""Show the notebook's MLflow dashboard through Colab, JarvisLabs, or an SSH tunnel."""
+"""Open a hosted MLflow dashboard or expose the VM dashboard through JarvisLabs or SSH."""
 
 import atexit
 from html import escape
@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
 
-_servers: dict[tuple[str, bool, str], tuple[subprocess.Popen, str]] = {}
+_servers: dict[tuple[str, str], tuple[subprocess.Popen, str]] = {}
 
 
 def _stop(process: subprocess.Popen) -> None:
@@ -28,8 +28,8 @@ def _stop(process: subprocess.Popen) -> None:
             pass
 
 
-def _serve(tracking_uri: str, *, in_colab: bool) -> str:
-    origin = "" if in_colab else os.getenv("MINIREASONER_JARVIS_ORIGIN", "").strip()
+def _serve(tracking_uri: str) -> str:
+    origin = os.getenv("MINIREASONER_JARVIS_ORIGIN", "").strip()
     if origin:
         # Host allowlists accept wildcards and commas. Accept only a single literal DNS host.
         match = re.fullmatch(r"https://(?:[a-zA-Z0-9-]+\.)+[a-zA-Z0-9-]+(?::(\d{1,5}))?/?", origin)
@@ -37,14 +37,14 @@ def _serve(tracking_uri: str, *, in_colab: bool) -> str:
             raise ValueError("Set MINIREASONER_JARVIS_ORIGIN to the HTTPS origin of the notebook, "
                              "for example https://INSTANCE.notebooksn.jarvislabs.net")
         origin = origin.rstrip("/").lower()
-    key = (tracking_uri, in_colab, origin)
+    key = (tracking_uri, origin)
     previous = _servers.get(key)
     if previous is not None and previous[0].poll() is None:
         return previous[1]
 
     with socket.socket() as sock:
         try:
-            sock.bind(("127.0.0.1", 0 if in_colab else 5000))
+            sock.bind(("127.0.0.1", 5000))
         except OSError:
             # Leave an existing service on port 5000 alone.
             sock.bind(("127.0.0.1", 0))
@@ -54,18 +54,11 @@ def _serve(tracking_uri: str, *, in_colab: bool) -> str:
         sys.executable, "-m", "mlflow", "server", "--host", "127.0.0.1",
         "--port", str(port), "--workers", "1",
     ]
-    if in_colab:
-        from google.colab import output
-
-        url = output.eval_js(f"google.colab.kernel.proxyPort({port})")
-    elif origin:
+    if origin:
         # Jupyter strips /proxy/PORT/ before forwarding. The trailing slash keeps the
         # browser's relative MLflow asset and API requests under the same proxy.
         url = f"{origin}/proxy/{port}/"
-    if in_colab or origin:
-        proxy = urlsplit(url or "")
-        if proxy.scheme != "https" or not proxy.hostname:
-            raise RuntimeError("Could not determine the HTTPS proxy URL for this notebook.")
+        proxy = urlsplit(origin)
         command.extend([
             "--allowed-hosts", f"127.0.0.1:*,localhost:*,{proxy.netloc}",
             "--cors-allowed-origins", f"{proxy.scheme}://{proxy.netloc}",
@@ -94,7 +87,7 @@ def _serve(tracking_uri: str, *, in_colab: bool) -> str:
         raise
 
 
-def open_mlflow_dashboard(tracking_uri: str, *, in_colab: bool) -> str | None:
+def open_mlflow_dashboard(tracking_uri: str) -> str | None:
     """Display a new-tab link to the dashboard for the notebook's tracking backend."""
     from IPython.display import HTML, display
 
@@ -103,19 +96,15 @@ def open_mlflow_dashboard(tracking_uri: str, *, in_colab: bool) -> str | None:
         # Only the browser-facing location belongs in saved notebook outputs.
         url = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
     elif parts.scheme.split("+")[0] in {"", "file", "sqlite", "postgresql", "mysql", "mssql"}:
-        url = _serve(tracking_uri, in_colab=in_colab)
+        url = _serve(tracking_uri)
     else:
         print("Open the dashboard supplied by your configured MLflow tracking service.")
         return None
     dashboard = urlsplit(url)
-    if not in_colab and dashboard.hostname in {"localhost", "127.0.0.1", "::1"}:
+    if dashboard.hostname in {"localhost", "127.0.0.1", "::1"}:
         port = dashboard.port or (443 if dashboard.scheme == "https" else 80)
         print(f"VS Code Remote SSH: forward port {port} in the Ports panel. "
               "If the local port differs, open the Local Address shown there.")
     display(HTML(f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">'
                  'Open MLflow dashboard in a new tab</a>'))
     return url
-
-
-def open_colab_dashboard(tracking_uri: str) -> str | None:
-    return open_mlflow_dashboard(tracking_uri, in_colab=True)

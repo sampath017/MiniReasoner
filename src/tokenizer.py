@@ -177,7 +177,7 @@ def prepared_corpus_manifest(directory: Path, corpus_settings: dict) -> dict | N
     if any(saved_manifest.get(key) != value for key, value in corpus_settings.items()):
         raise ValueError(
             f"Packed data in {directory} uses different settings. "
-            "Restore the original settings to reuse it or choose a new workspace_dir."
+            "Restore the original settings to reuse this corpus or choose a different tokenized data directory."
         )
     return saved_manifest
 

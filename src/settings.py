@@ -1,11 +1,7 @@
-import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-COLAB_RUNTIME_DIR = Path("/content/MiniReasoner")
-COLAB_DRIVE_MOUNT = Path("/content/drive")
-COLAB_DRIVE_DIR = COLAB_DRIVE_MOUNT / "MyDrive" / "MiniReasoner"
 DATA_DIR = PROJECT_ROOT / "data"
 VALIDATION_FRACTION = 0.01
 DATASET_CACHE_SUBDIR = Path("data") / "raw"
@@ -16,21 +12,9 @@ SIMPLESTORIES_TRAIN_FILES = "data/train-*.parquet"
 
 MLFLOW_EXPERIMENT = "minireasoner"
 MLFLOW_DB_SUBPATH = Path("runs") / "mlflow.db"
-COLAB_CHECKPOINT_ROOT = COLAB_DRIVE_DIR / "checkpoints"
 RCLONE_CHECKPOINT_ROOT = "gdrive:MiniReasoner/checkpoints"
 CHECKPOINT_LIMIT: int | None = None  # Keep every checkpoint unless a limit is set.
 VOCAB_SIZE = 1_024
-
-
-def notebook_secret(name: str, *, in_colab: bool) -> str | None:
-    value = os.environ.get(name, "").strip()
-    if value or not in_colab:
-        return value or None
-    from google.colab import userdata
-    try:
-        return (userdata.get(name) or "").strip() or None
-    except (userdata.SecretNotFoundError, userdata.NotebookAccessError, userdata.TimeoutException):
-        return None
 
 
 PRESETS = {

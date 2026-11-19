@@ -1,7 +1,8 @@
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import torch
 
@@ -20,27 +21,43 @@ def publish_checkpoint(store: CheckpointStore, path: Path, metrics: dict, run) -
 
 @contextmanager
 def checkpoint_uploads(store: CheckpointStore, run):
-    """Stage one immutable snapshot and upload it while the next batches train."""
-    with (
-        TemporaryDirectory(prefix="minireasoner-checkpoint-") as directory,
-        ThreadPoolExecutor(max_workers=1) as worker,
-    ):
-        path = Path(directory) / "checkpoint.pt"
-        pending = None
+    """Queue independent snapshots for ordered upload while training continues."""
+    def upload(path: Path, metrics: dict) -> None:
+        try:
+            publish_checkpoint(store, path, metrics, run)
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not publish checkpoint at step {metrics['step']:,}. "
+                f"The complete snapshot is available at {path}."
+            ) from error
+        path.unlink()
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        pending = deque()
 
         def save(checkpoint: dict) -> None:
-            nonlocal pending
-            if pending is not None:
-                pending.result()  # Finish reading the previous snapshot before reusing its path.
-            torch.save(checkpoint, path)  # state_dict tensors still reference the live model.
+            while pending and pending[0].done():
+                pending.popleft().result()
             metrics = checkpoint["metrics"][-1].copy()
-            pending = worker.submit(publish_checkpoint, store, path, metrics, run)
+            snapshot = NamedTemporaryFile(
+                prefix=f"minireasoner-step-{metrics['step']}-", suffix=".pt", delete=False,
+            )
+            path = Path(snapshot.name)
+            try:
+                with snapshot:
+                    # The model and optimizer tensors still reference live weights.
+                    torch.save(checkpoint, snapshot)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            pending.append(worker.submit(upload, path, metrics))
+            print(f"Queued Drive checkpoint at step {metrics['step']:,}.", flush=True)
 
         try:
             yield save
         finally:
-            if pending is not None:
-                pending.result()
+            for future in pending:
+                future.result()
 
 
 @contextmanager
