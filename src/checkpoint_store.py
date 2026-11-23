@@ -1,21 +1,69 @@
-"""Keep complete training checkpoints on mounted Drive or an authenticated rclone remote."""
+"""Save and restore complete training checkpoints from a run folder in Azure Blob Storage."""
 
 from dataclasses import asdict, dataclass
 import math
-import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
-import sysconfig
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit, urlunsplit
 
-from .settings import CHECKPOINT_LIMIT
+from azure.core.exceptions import ResourceNotFoundError
+
+from .azure_blob import AzureBlobFiles, container_client
+from .settings import AZURE_CONTAINER, CHECKPOINT_LIMIT, MLFLOW_EXPERIMENT
 from .tokenizer import sha256
 
 
 _LOSS = r"[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?"
 _FILENAME = re.compile(rf"step-(\d+)_val-({_LOSS})_train-({_LOSS})_([a-f0-9]{{64}})\.pt")
+_RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def experiment_checkpoint_prefix(experiment: str = MLFLOW_EXPERIMENT) -> str:
+    """Return the normalized Azure blob prefix holding per-run checkpoint folders."""
+    folder = experiment.strip("/")
+    if not folder or any(part in ("", ".", "..") for part in folder.split("/")):
+        raise ValueError("A checkpoint store needs a valid experiment path.")
+    return f"checkpoints/{folder}/"
+
+
+def list_azure_run_blobs(
+    container: str = AZURE_CONTAINER,
+    *,
+    experiment: str = MLFLOW_EXPERIMENT,
+) -> dict[str, list[dict]]:
+    """Group blobs in Azure under `checkpoints/<experiment>/<run_id>/` by run ID."""
+    prefix = experiment_checkpoint_prefix(experiment)
+    run_pattern = re.compile(rf"^{re.escape(prefix)}([A-Za-z0-9_-]+)/(.+)$")
+    client = container_client(container)
+    runs: dict[str, list[dict]] = {}
+    for blob in client.list_blobs(name_starts_with=prefix):
+        match = run_pattern.match(blob.name)
+        if not match:
+            continue
+        run_id, filename = match.groups()
+        if not _RUN_ID.fullmatch(run_id):
+            continue
+        runs.setdefault(run_id, []).append({
+            "name": blob.name,
+            "filename": filename,
+            "size": int(blob.size or 0),
+            "last_modified": blob.last_modified,
+        })
+    return runs
+
+
+def delete_azure_blobs(container: str, blob_names: list[str]) -> int:
+    """Delete the named blobs from `container`, ignoring already-missing blobs."""
+    client = container_client(container)
+    deleted = 0
+    for name in blob_names:
+        try:
+            client.delete_blob(name)
+            deleted += 1
+        except ResourceNotFoundError:
+            pass
+    return deleted
 
 
 @dataclass(frozen=True)
@@ -30,80 +78,26 @@ class _Snapshot:
         return self.val_loss, self.train_loss_interval_mean, -self.step, self.name
 
 
-def _rclone(*args: str, allow_missing: bool = False) -> str:
-    # A Jupyter kernel can use the project Python without its scripts directory on PATH.
-    executable = shutil.which("rclone", path=sysconfig.get_path("scripts")) or shutil.which("rclone")
-    if executable is None:
-        raise FileNotFoundError(
-            "The notebook kernel cannot find rclone. On a Linux GPU VM, run "
-            "'uv sync --locked' from the project directory and select its .venv kernel. "
-            "On other platforms, install the rclone CLI or use a writable Drive mount."
-        )
-    result = subprocess.run([executable, *args], capture_output=True, text=True, encoding="utf-8")
-    if allow_missing and result.returncode in (3, 4):  # Directory or file absent.
-        return ""
-    if result.returncode < 0:
-        raise RuntimeError(f"rclone {args[0]} was interrupted by signal {-result.returncode}.")
-    if result.returncode:
-        raise RuntimeError(f"rclone {args[0]} failed: {result.stderr.strip()}")
-    return result.stdout
-
-
-def _remote_name(root: str | Path) -> str | None:
-    base = str(root).strip()
-    if not base or "://" in base:
-        raise ValueError("Use a writable mounted Drive directory or an authenticated rclone remote path.")
-    if isinstance(root, str) and not re.match(r"^[A-Za-z]:[\\/]", base):
-        match = re.match(r"^([A-Za-z0-9][\w .-]*):", base)
-        if match:
-            return match[1]
-    return None
-
-
-def check_checkpoint_root(root: str | Path) -> None:
-    """Check the VM's named remote before preparing data or opening an MLflow run."""
-    remote = _remote_name(root)
-    if remote and f"{remote}:" not in _rclone("listremotes").splitlines():
-        raise ValueError(
-            f"The rclone remote '{remote}' is missing. In the project terminal run "
-            f"'uv run rclone config', create a writable Google Drive remote named '{remote}', "
-            "then rerun this settings cell."
-        )
-
-
 class CheckpointStore:
-    def __init__(self, root: str | Path, run_id: str, *, keep: int | None = CHECKPOINT_LIMIT):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+    def __init__(self, container: str, run_id: str, *, experiment: str = MLFLOW_EXPERIMENT,
+                 keep: int | None = CHECKPOINT_LIMIT):
+        if not _RUN_ID.fullmatch(run_id):
             raise ValueError("A checkpoint store needs a valid run ID.")
         if keep is not None and (type(keep) is not int or keep < 1):
             raise ValueError("Set the checkpoint limit to None or a positive integer.")
-        base = str(root).strip()
+        prefix = f"{experiment_checkpoint_prefix(experiment)}{run_id}"
         self.keep = keep
-        self._remote = _remote_name(root) is not None
-        if self._remote:
-            base = base.rstrip("/")
-            self.location = base + ("" if base.endswith(":") else "/") + run_id
-        else:
-            self.location = str(Path(base).expanduser().resolve() / run_id)
+        self.files = AzureBlobFiles(container, prefix)
+        # The SDK endpoint can include a SAS query string. Only publish the resource path.
+        endpoint = urlsplit(self.files.container.url)
+        self.location = urlunsplit((endpoint.scheme, endpoint.netloc, f"{endpoint.path.rstrip('/')}/{prefix}", "", ""))
 
     def prepare(self) -> None:
-        """Create the run folder before spending GPU time on a new training run."""
-        if self._remote:
-            _rclone("mkdir", self.location)
-        else:
-            Path(self.location).mkdir(parents=True, exist_ok=True)
+        self.files.prepare()
 
     def _versions(self) -> list[_Snapshot]:
-        if self._remote:
-            names = _rclone("lsf", "--files-only", self.location, allow_missing=True).splitlines()
-        else:
-            directory = Path(self.location)
-            if not directory.exists():
-                return []
-            names = [p.name for p in directory.iterdir() if p.is_file() and not p.is_symlink()]
-
         versions = []
-        for name in names:
+        for name in self.files.names():
             match = _FILENAME.fullmatch(name)
             if match:
                 step, val, train, digest = match.groups()
@@ -117,23 +111,7 @@ class CheckpointStore:
         path = Path(path)
         digest = sha256(path)
         name = f"step-{step}_val-{abs(val)!r}_train-{abs(train)!r}_{digest}.pt"
-        if self._remote:
-            # Drive commits a new binary object only after its upload completes.
-            _rclone("copyto", "--immutable", "--checksum", str(path.resolve()), f"{self.location}/{name}")
-        else:
-            directory = Path(self.location)
-            directory.mkdir(parents=True, exist_ok=True)
-            final = directory / name
-            if not final.is_file() or sha256(final) != digest:
-                with TemporaryDirectory(prefix=".upload-", dir=directory) as tmp:
-                    staged = Path(tmp) / "checkpoint.pt"
-                    with path.open("rb") as source, staged.open("wb") as output:
-                        shutil.copyfileobj(source, output, length=1024 * 1024)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    if sha256(staged) != digest:
-                        raise OSError(f"Drive copy failed its checksum at step {step}.")
-                    staged.replace(final)
+        self.files.put(path, name, digest=digest)
         self.prune()
         return name
 
@@ -151,10 +129,7 @@ class CheckpointStore:
             if version.step not in kept_steps and len(kept_steps) < self.keep:
                 kept_steps.add(version.step)
                 continue
-            if self._remote:
-                _rclone("deletefile", f"{self.location}/{version.name}", allow_missing=True)
-            else:
-                (Path(self.location) / version.name).unlink(missing_ok=True)
+            self.files.delete(version.name)
 
     def download(self, alias: str, destination: Path) -> dict:
         versions = self._versions()
@@ -173,11 +148,8 @@ class CheckpointStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(dir=destination.parent) as tmp:
             staged = Path(tmp) / "checkpoint.pt"
-            if self._remote:
-                _rclone("copyto", f"{self.location}/{selected.name}", str(staged.resolve()))
-            else:
-                shutil.copyfile(Path(self.location) / selected.name, staged)
+            self.files.get(selected.name, staged)
             if sha256(staged) != selected.sha256:
-                raise ValueError(f"Checksum mismatch for Drive checkpoint at step {selected.step}.")
+                raise ValueError(f"Checksum mismatch for Azure checkpoint at step {selected.step}.")
             staged.replace(destination)
         return asdict(selected)

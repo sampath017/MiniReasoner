@@ -10,9 +10,9 @@ DATASET_CACHE_DIR = PROJECT_ROOT / DATASET_CACHE_SUBDIR
 TOKENIZED_DATA_DIR = PROJECT_ROOT / TOKENIZED_DATA_SUBDIR
 SIMPLESTORIES_TRAIN_FILES = "data/train-*.parquet"
 
-MLFLOW_EXPERIMENT = "minireasoner"
-MLFLOW_DB_SUBPATH = Path("runs") / "mlflow.db"
-RCLONE_CHECKPOINT_ROOT = "gdrive:MiniReasoner/checkpoints"
+MLFLOW_EXPERIMENT = "/Shared/MiniReasoner"
+DRIVE_DATA_ROOT = "gdrive:MiniReasoner/data"
+AZURE_CONTAINER = "minireasoner"
 CHECKPOINT_LIMIT: int | None = None  # Keep every checkpoint unless a limit is set.
 VOCAB_SIZE = 1_024
 
@@ -20,20 +20,22 @@ VOCAB_SIZE = 1_024
 PRESETS = {
     "base": {
         "model": {
-            "context_length": 256,
+            "context_length": 1024,
             "n_layer": 10,
             "n_head": 8,
             "n_embd": 512,
+            "rope_theta": 10000.0,
+            "pos_encoding": "rope",
         },
         "training": {
-            "batch_size": 64,
+            "batch_size": 32,
             "epochs": 1,
-            "warmup_steps": 50,
-            "learning_rate": 0.0005,
-            "min_learning_rate": 0.00005,
+            "warmup_steps": 700,
+            "learning_rate": 0.00065,
+            "min_learning_rate": 0.000065,
             "weight_decay": 0.1,
             "eval_every": 500,
-            "eval_token_fraction": 0.5,
+            "eval_token_fraction": 0.1,
             "seed": 42,
         },
     },
@@ -43,6 +45,8 @@ PRESETS = {
             "n_layer": 2,
             "n_head": 4,
             "n_embd": 64,
+            "rope_theta": 10000.0,
+            "pos_encoding": "rope",
         },
         "training": {
             "batch_size": 32,

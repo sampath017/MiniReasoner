@@ -1,110 +1,25 @@
-"""Open a hosted MLflow dashboard or expose the VM dashboard through JarvisLabs or SSH."""
+"""Display links to training runs in the Databricks MLflow UI."""
 
-import atexit
 from html import escape
-import os
-import re
-import signal
-import socket
-import subprocess
-import sys
-from tempfile import NamedTemporaryFile
-from time import monotonic, sleep
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import urlopen
+from urllib.parse import quote
+
+from .metrics import databricks_host
 
 
-_servers: dict[tuple[str, str], tuple[subprocess.Popen, str]] = {}
-
-
-def _stop(process: subprocess.Popen) -> None:
-    if process.poll() is None:
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
-
-
-def _serve(tracking_uri: str) -> str:
-    origin = os.getenv("MINIREASONER_JARVIS_ORIGIN", "").strip()
-    if origin:
-        # Host allowlists accept wildcards and commas. Accept only a single literal DNS host.
-        match = re.fullmatch(r"https://(?:[a-zA-Z0-9-]+\.)+[a-zA-Z0-9-]+(?::(\d{1,5}))?/?", origin)
-        if not match or (match[1] is not None and not 1 <= int(match[1]) <= 65535):
-            raise ValueError("Set MINIREASONER_JARVIS_ORIGIN to the HTTPS origin of the notebook, "
-                             "for example https://INSTANCE.notebooksn.jarvislabs.net")
-        origin = origin.rstrip("/").lower()
-    key = (tracking_uri, origin)
-    previous = _servers.get(key)
-    if previous is not None and previous[0].poll() is None:
-        return previous[1]
-
-    with socket.socket() as sock:
-        try:
-            sock.bind(("127.0.0.1", 5000))
-        except OSError:
-            # Leave an existing service on port 5000 alone.
-            sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    url = f"http://localhost:{port}"
-    command = [
-        sys.executable, "-m", "mlflow", "server", "--host", "127.0.0.1",
-        "--port", str(port), "--workers", "1",
-    ]
-    if origin:
-        # Jupyter strips /proxy/PORT/ before forwarding. The trailing slash keeps the
-        # browser's relative MLflow asset and API requests under the same proxy.
-        url = f"{origin}/proxy/{port}/"
-        proxy = urlsplit(origin)
-        command.extend([
-            "--allowed-hosts", f"127.0.0.1:*,localhost:*,{proxy.netloc}",
-            "--cors-allowed-origins", f"{proxy.scheme}://{proxy.netloc}",
-        ])
-    # The backend URI can include credentials. Pass it through the environment.
-    with NamedTemporaryFile(prefix="minireasoner-mlflow-", suffix=".log", delete=False) as log:
-        process = subprocess.Popen(
-            command, env={**os.environ, "MLFLOW_BACKEND_STORE_URI": tracking_uri},
-            stdout=log, stderr=subprocess.STDOUT, start_new_session=os.name == "posix",
-        )
-    try:
-        deadline = monotonic() + 60
-        while process.poll() is None and monotonic() < deadline:
-            try:
-                with urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
-                    if response.status == 200 and process.poll() is None:
-                        _servers[key] = (process, url)
-                        atexit.register(_stop, process)
-                        return url
-            except OSError:
-                pass
-            sleep(0.3)
-        raise RuntimeError(f"MLflow did not start. See the runtime log at {log.name}.")
-    except BaseException:
-        _stop(process)
-        raise
-
-
-def open_mlflow_dashboard(tracking_uri: str) -> str | None:
-    """Display a new-tab link to the dashboard for the notebook's tracking backend."""
+def open_mlflow_dashboard(*, experiment_id: str | None = None, run_id: str | None = None) -> str:
+    """Display a workspace, experiment or run link in the notebook."""
     from IPython.display import HTML, display
 
-    parts = urlsplit(tracking_uri)
-    if parts.scheme in {"http", "https"} and parts.hostname:
-        # Only the browser-facing location belongs in saved notebook outputs.
-        url = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
-    elif parts.scheme.split("+")[0] in {"", "file", "sqlite", "postgresql", "mysql", "mssql"}:
-        url = _serve(tracking_uri)
-    else:
-        print("Open the dashboard supplied by your configured MLflow tracking service.")
-        return None
-    dashboard = urlsplit(url)
-    if dashboard.hostname in {"localhost", "127.0.0.1", "::1"}:
-        port = dashboard.port or (443 if dashboard.scheme == "https" else 80)
-        print(f"VS Code Remote SSH: forward port {port} in the Ports panel. "
-              "If the local port differs, open the Local Address shown there.")
+    if run_id and not experiment_id:
+        raise ValueError("A Databricks run URL requires its experiment ID.")
+    url = f"{databricks_host()}/ml/experiments"
+    label = "Open Databricks experiments"
+    if experiment_id:
+        url += f"/{quote(experiment_id, safe='')}"
+        label = "Open experiment in Databricks"
+    if run_id:
+        url += f"/runs/{quote(run_id, safe='')}"
+        label = "Open training run in Databricks"
     display(HTML(f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">'
-                 'Open MLflow dashboard in a new tab</a>'))
+                 f'{label}</a>'))
     return url

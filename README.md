@@ -4,67 +4,125 @@ MiniReasoner is a decoder-only Transformer trained to predict the next token in 
 
 ## Model and training settings
 
-Choose `base` or `small` in the notebook. Parameter counts assume a 1,024-token vocabulary and count the shared input embedding and output weights once. [Preset definitions](src/settings.py)
+Choose `base` or `small` via `--preset` when launching training (defaults to `base`). Parameter counts assume a 1,024-token vocabulary and count the shared input embedding and output weights once. [Preset definitions](src/settings.py)
 
 | Setting                            |   Base (default) |          Small |
 | ---------------------------------- | ---------------: | -------------: |
-| Trainable parameters               |       32,180,224 |        169,728 |
+| Trainable parameters               |       32,049,152 |        165,632 |
+| Positional embeddings              |  RoPE (θ = 10,000)|  RoPE (θ = 10,000)|
 | Transformer blocks                 |               10 |              2 |
 | Attention heads                    |                8 |              4 |
 | Embedding dimension                |              512 |             64 |
-| Context length (tokens per window) |              256 |             64 |
-| Batch size (windows per step)      |               64 |             32 |
-| Prediction targets per full step   |           16,384 |          2,048 |
-| Training duration                  |          1 epoch |       60 steps |
-| Learning rate (peak → minimum)     | 0.0005 → 0.00005 | 0.001 → 0.0001 |
-| Warmup steps                       |               50 |              5 |
+| Context length (tokens per window) |            1,024 |             64 |
+| Batch size (windows per step)      |               32 |             32 |
+| Prediction targets per full step   |           32,768 |          2,048 |
+| Training duration                  | 1 epoch (~26,047)|       60 steps |
+| Learning rate (peak → minimum)     |0.00065 → 0.000065| 0.001 → 0.0001 |
+| Warmup steps                       |              700 |              5 |
 | Validation interval                |        500 steps |       20 steps |
 
-Both presets use AdamW with weight decay 0.1. CUDA training uses BF16 when supported or FP32 on a T4. For a local FP32 CPU run, set `preset = "small"` and `training_device = "cpu"` in the notebook. Inference defaults to CPU.
+Both presets train on the VM's CUDA GPU using AdamW with weight decay 0.1 and Rotary Positional Embeddings (RoPE). Training uses BF16 on modern GPUs (e.g. NVIDIA A30) and FP32 otherwise.
 
-The base notebook pauses at optimizer step 12,000 on its one-epoch learning-rate schedule. On resume, use the original MLflow run ID and training settings. Set `stop_after` to a later step to continue beyond 12,000.
+The base preset trains a 32M RoPE model from scratch for 1 epoch (~26,047 steps at 32,768 tokens/step) on the ~853.5M-token SimpleStories training corpus. The small preset starts a fresh 60-step run.
 
 ## Loss metrics
 
-The notebook prints the current batch loss at every step. At each validation check it also prints the interval's mean training loss beside validation loss. MLflow records all three against the optimizer step.
+The training CLI prints the current batch loss at every step (4 decimal digits, `.4f`) and mirrors each run's full output to its own file under `logs/`. At each validation check it also prints the interval's mean training loss beside validation loss. MLflow records all three against the optimizer step.
 
 | MLflow metric              | What it measures                                                                                                                                   |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `train_loss`               | Next-token cross-entropy for the current training batch.                                                                                           |
-| `val_loss`                 | Mean cross-entropy over a fresh random half of the packed validation targets. Measured at step 0, each validation interval, and the stopping step. |
+| `val_loss`                 | Mean cross-entropy over a fresh random sample of the packed validation targets (`eval_token_fraction`). Measured at step 0, each validation interval, and the stopping step. |
 | `train_loss_interval_mean` | Mean training loss since the previous check, weighted by the number of prediction targets.                                                         |
 
 ## Start a run on the VM
 
-Leave `resume = False` and `mlflow_run_id = None` to start from scratch. Save the run ID the notebook prints. MLflow tracks parameters and losses. Its `checkpoint_location` tag identifies the Google Drive folder holding the model and optimizer.
+Run both presets on a CUDA VM. On JarvisLabs, run the [setup script](scripts/jarvis_labs.sh) from your MiniReasoner checkout.
 
-On a fresh JarvisLabs VM, download and run the [setup script](scripts/jarvis_labs.sh). It clones MiniReasoner into `/home/MiniReasoner`, installs missing tools including `nvtop` and `uv`, runs `uv sync --locked --python 3.12`, and creates a private `.env` from the template if needed.
+```bash
+bash scripts/jarvis_labs.sh
+```
+
+For a fresh VM, download the script and run it to clone the project into `/home/MiniReasoner`, install `nvtop`, and sync the locked Python environment.
 
 ```bash
 curl -fsSLo /tmp/jarvis_labs.sh https://raw.githubusercontent.com/sampath017/MiniReasoner/main/scripts/jarvis_labs.sh
 bash /tmp/jarvis_labs.sh
 ```
 
-From an existing checkout, run `bash scripts/jarvis_labs.sh`. It reuses that checkout and its settings. Open [notebooks/main.ipynb](notebooks/main.ipynb) using the project's `.venv` kernel.
+Use an existing private **Azure Blob Storage** container named `minireasoner` (or change `AZURE_CONTAINER` in `src/settings.py`). Hot storage with locally redundant storage (LRS) suits frequently restored checkpoints. Give the VM access to read, list, and write blobs. Deleting blobs is needed only if you enable checkpoint pruning.
 
-**DagsHub charts and Google Drive checkpoints.** Set these three values in the VM's `.env`. Use a DagsHub access token with write access to the repository.
+Fill in the entries in the project-root `.env` from [.env.example](.env.example).
 
-```dotenv
-MLFLOW_TRACKING_URI=https://dagshub.com/YOUR_ACCOUNT/YOUR_REPOSITORY.mlflow
-MLFLOW_TRACKING_USERNAME=YOUR_ACCOUNT
-MLFLOW_TRACKING_PASSWORD=YOUR_DAGSHUB_ACCESS_TOKEN
+| Variable | Value |
+| --- | --- |
+| `AZURE_STORAGE_CONNECTION_STRING` | Connection string for the account containing the private checkpoint container |
+| `DATABRICKS_HOST` | HTTPS workspace URL |
+| `DATABRICKS_TOKEN` | Workspace token with permission to log runs under `/Shared/MiniReasoner` |
+| `RCLONE_CONFIG_BASE64` | Base64-encoded `rclone.conf` for unattended `gdrive:` access (optional if `rclone` is already configured) |
+
+For container-scoped access, generate a SAS on the `minireasoner` container with Read, Write, and List permissions and HTTPS only. Set `AZURE_STORAGE_CONNECTION_STRING` to `BlobEndpoint=https://<account>.blob.core.windows.net;SharedAccessSignature=<token>`. Use the token text without its leading question mark. Enable Delete only if the VM will prune checkpoints. [Azure SAS connection strings](https://learn.microsoft.com/en-us/azure/storage/common/storage-configure-connection-string#create-a-connection-string-using-a-shared-access-signature)
+
+### Headless background training via `tmux` (survives terminal disconnects)
+
+To start long-running training inside a detached `tmux` session (`train`) that keeps running when you close your SSH terminal, browser, or laptop:
+
+```bash
+# Start training in tmux and attach immediately (Ctrl+B, then D to detach)
+bash scripts/train.sh --preset base
+
+# Re-attach to the running tmux session
+bash scripts/train.sh attach
+
+# Monitor status, GPU stats, and recent log lines
+bash scripts/train.sh status
+
+# Stream live training logs without attaching to tmux
+bash scripts/train.sh logs
+
+# Stop gracefully when needed (saves checkpoint to Azure before exiting)
+bash scripts/train.sh stop
 ```
 
-DagsHub keeps each run's settings, tags and loss history after the VM stops. Google Drive stores its model and optimizer under `MiniReasoner/checkpoints/<run-id>/`. [DagsHub MLflow setup](https://dagshub.com/docs/integration_guide/mlflow_tracking/)
+You can also run [src/main.py](src/main.py) directly:
+```bash
+python src/main.py --preset base
+# Or resume an existing run:
+python src/main.py --preset base --resume --run-id <MLFLOW_RUN_ID>
+```
 
-**SQLite tracking.** With `MLFLOW_TRACKING_URI` blank, the notebook backs up its local database to `MiniReasoner/tracking/mlflow.db` on Drive during training and when a run closes. A fresh runtime restores the most recent backup. Use one training runtime at a time with this database.
+### Evaluation & Inference Notebook
 
-**Google Drive on the VM.** From the project directory, use `.venv/bin/rclone listremotes` to check for `gdrive:`. On first setup, use `.venv/bin/rclone config` to create that remote and grant it write access. [Google Drive setup for rclone](https://rclone.org/drive/) · [Authorizing a headless VM](https://rclone.org/remote_setup/)
+Use [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) to inspect checkpoints from Azure Blob Storage, plot convergence curves, evaluate perplexity and arithmetic baselines, and generate stories on both CPU and GPU.
 
-For the **SQLite dashboard in a JarvisLabs browser**, set `MINIREASONER_JARVIS_ORIGIN` to the notebook's HTTPS origin, e.g. `https://YOUR_INSTANCE.notebooksn.jarvislabs.net`. Restart the kernel after updating the project or its environment. The dashboard cell generates the `/proxy/<port>/` link.
+## Reuse the corpus and save checkpoints
 
-With **VS Code Remote – SSH**, select the project's `.venv` kernel. For the SQLite dashboard, use **Ports → Forward a Port** if prompted and open the **Local Address** in your browser. For DagsHub, **Open MLflow** goes directly to your hosted dashboard. [VS Code port forwarding](https://code.visualstudio.com/docs/remote/ssh#_forwarding-a-port-creating-ssh-tunnel)
+Jarvis setup installs `tmux` and checks that it can list Google Drive using the `gdrive` connection before it reports ready. When `RCLONE_CONFIG_BASE64` is present in `.env`, `scripts/jarvis_labs.sh` configures `gdrive:` automatically with no interactive prompts. Otherwise, run setup in a VM terminal and authorize Google Drive interactively. [Google OAuth client setup](https://rclone.org/drive/#making-your-own-client-id) · [rclone remote setup](https://rclone.org/remote_setup/)
 
-The notebook reuses the verified corpus in `data/tokenized/full-val-0.01/`. To restore it on a fresh VM, set `MINIREASONER_CORPUS_DRIVE_URL` in the project's `.env` to the Google Drive link for the folder containing `train.bin`, `val.bin`, `tokenizer.json`, and `manifest.json`. The folder must allow anyone with the link to download its contents.
+| Location | Contents |
+| --- | --- |
+| Google Drive · `My Drive/MiniReasoner/data/raw/` | SimpleStories training text saved during fresh preparation |
+| Google Drive · `My Drive/MiniReasoner/data/tokenized/full-val-0.01/` | Tokenizer, packed training and validation tokens, and their manifest |
+| Azure · `minireasoner/checkpoints/Shared/MiniReasoner/<run-id>/` | Snapshots with the model weights, optimizer, tokenizer, and training history |
+| Databricks · `/Shared/MiniReasoner` | Per-run training and validation curves, settings, and the Azure checkpoint location |
+| Local VM · `logs/` | Per-run training logs (`logs/train_<TIMESTAMP>_<PRESET>.log` and `logs/latest.log`) |
 
-**Checkpoints.** The default `CHECKPOINT_LIMIT = None` in [settings.py](src/settings.py) keeps every checkpoint on Drive, including across resumes. A positive limit enables pruning. For example, `5` keeps the latest checkpoint and the four best earlier steps by validation loss, with interval-mean training loss breaking ties. Uploads overlap training, and the notebook waits for the final upload at a planned stop. To resume, set `resume = True` and the saved `mlflow_run_id` with the same tracking backend and Drive root. CPU inference can use `latest`, `best`, or `step-N` directly from Drive.
+A fresh VM downloads the prepared corpus from Drive and verifies its file sizes and checksums before training. An existing folder with `manifest.json`, `tokenizer.json`, `train.bin`, and `val.bin` works directly when its manifest matches the corpus settings. The VM reads training batches from its disk cache. If preparation is needed, it reuses raw training stories from Drive or fetches them from Hugging Face, fits BPE on the training portion, and saves the finished corpus to Drive.
+
+Uploads run in the background after validation. The training runner waits for pending uploads on completion or `SIGINT`/`SIGTERM`. `CHECKPOINT_LIMIT = None` keeps every checkpoint. To resume on a GPU VM, pass `--resume --run-id <MLFLOW_RUN_ID>` to `bash scripts/train.sh` or `python src/main.py` using the same storage container, experiment path, corpus, and training settings.
+
+When the run is complete, open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) with the project's `.venv` kernel (on either a local CPU machine or a CUDA GPU VM) to auto-select the best checkpoint from Azure, inspect metrics, and run inference benchmarks.
+
+To remove Azure checkpoints for runs you deleted in the Databricks MLflow UI:
+
+```bash
+# Safe dry-run preview (lists active, deleted, and missing runs)
+uv run python src/main.py cleanup
+
+# Delete orphaned Azure blobs for runs deleted in Databricks MLflow
+uv run python src/main.py cleanup --delete
+```
+
+## CPU inference
+
+Open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to select the latest Azure run's lowest-loss checkpoint, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.generate.complete()` directly from Python.

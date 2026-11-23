@@ -3,8 +3,8 @@ name = "mini-reasoner"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "azure-storage-blob>=12.24,<13",
     "datasets>=3,<5",
-    "gdown>=6.4.1,<7",
     "mlflow>=3.7,<4",
     "numpy>=1.26,<3",
     "rclone-bin==1.76.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
