@@ -3,6 +3,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
+SFT_DATA_DIR = DATA_DIR / "sft" / "arithmetic"
 VALIDATION_FRACTION = 0.01
 DATASET_CACHE_SUBDIR = Path("data") / "raw"
 TOKENIZED_DATA_SUBDIR = Path("data") / "tokenized" / f"full-val-{VALIDATION_FRACTION}"
@@ -59,5 +60,62 @@ PRESETS = {
             "eval_token_fraction": 0.5,
             "seed": 42,
         },
+    },
+}
+
+SFT_DATA_DEFAULTS = {
+    "ops": ("add", "sub", "mul", "div"),
+    "max_digits": 3,
+    "allow_negative": True,
+    "samples_per_op": 12_000,
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+    "seed": 42,
+}
+
+SFT_PRESETS = {
+    "sft": {
+        "base_checkpoint_alias": "latest",
+        "context_length": None,  # Inherits base checkpoint context_length (1,024); override e.g. 2048 via CLI.
+        "ops": SFT_DATA_DEFAULTS["ops"],
+        "max_digits": SFT_DATA_DEFAULTS["max_digits"],
+        "allow_negative": SFT_DATA_DEFAULTS["allow_negative"],
+        "samples_per_op": SFT_DATA_DEFAULTS["samples_per_op"],
+        "val_fraction": SFT_DATA_DEFAULTS["val_fraction"],
+        "test_fraction": SFT_DATA_DEFAULTS["test_fraction"],
+        "val_eval_problems": 240,
+        "retention_ratio": 0.1,
+        "retention_eval_batches": 8,
+        "batch_size": 32,
+        "steps": 1200,
+        "warmup_steps": 60,
+        "learning_rate": 2e-4,
+        "min_learning_rate": 2e-5,
+        "weight_decay": 0.05,
+        "eval_every": 200,
+        "eval_token_fraction": 1.0,
+        "seed": 42,
+    },
+    "sft_pilot": {
+        "base_checkpoint_alias": "latest",
+        "context_length": None,
+        "ops": SFT_DATA_DEFAULTS["ops"],
+        "max_digits": SFT_DATA_DEFAULTS["max_digits"],
+        "allow_negative": SFT_DATA_DEFAULTS["allow_negative"],
+        "samples_per_op": SFT_DATA_DEFAULTS["samples_per_op"],
+        "val_fraction": SFT_DATA_DEFAULTS["val_fraction"],
+        "test_fraction": SFT_DATA_DEFAULTS["test_fraction"],
+        "val_eval_problems": 120,
+        "retention_ratio": 0.1,
+        "retention_eval_batches": 4,
+        "batch_size": 16,
+        "steps": 200,
+        "warmup_steps": 20,
+        "learning_rate": 2e-4,
+        "min_learning_rate": 2e-5,
+        "weight_decay": 0.05,
+        "eval_every": 50,
+        "eval_token_fraction": 1.0,
+        "seed": 42,
     },
 }

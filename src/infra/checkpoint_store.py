@@ -10,8 +10,8 @@ from urllib.parse import urlsplit, urlunsplit
 from azure.core.exceptions import ResourceNotFoundError
 
 from .azure_blob import AzureBlobFiles, container_client
-from .settings import AZURE_CONTAINER, CHECKPOINT_LIMIT, MLFLOW_EXPERIMENT
-from .tokenizer import sha256
+from ..core.tokenizer import sha256
+from ..settings import AZURE_CONTAINER, CHECKPOINT_LIMIT, MLFLOW_EXPERIMENT
 
 
 _LOSS = r"[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?"

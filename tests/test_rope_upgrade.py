@@ -17,10 +17,11 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from src.generate import complete
-from src.model import GPT, GPTConfig
+from src.core.checkpoint import load_checkpoint
+from src.core.generate import complete
+from src.core.model import GPT, GPTConfig
 from src.settings import PRESETS, VOCAB_SIZE
-from src.train import EpochBatchSampler, TokenStream, TrainConfig, load_checkpoint
+from src.training.common import EpochBatchSampler, TokenStream, TrainConfig
 
 
 def test_architecture_and_forward_backward():

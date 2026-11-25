@@ -8,7 +8,7 @@ from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import ContainerClient
 
-from .tokenizer import sha256
+from ..core.tokenizer import sha256
 
 
 def container_client(container: str) -> ContainerClient:

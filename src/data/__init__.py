@@ -1,0 +1,47 @@
+"""Corpus preparation and Phase 4 arithmetic dataset helpers."""
+
+from .arithmetic import (
+    DEFAULT_OPS,
+    GENERATOR_VERSION,
+    SUPPORTED_OPS,
+    ArithmeticExample,
+    CanonicalProblem,
+    build_arithmetic_dataset,
+    collate_sft_batch,
+    dataset_slug,
+    encode_sft_example,
+    encode_sft_split,
+    extract_strict_integer,
+    load_arithmetic_dataset,
+    load_or_restore_arithmetic_dataset,
+    normalize_ops,
+    prepare_arithmetic_dataset,
+    save_arithmetic_dataset,
+    score_arithmetic_completion,
+    select_stratified_eval_problems,
+    summarize_arithmetic_dataset,
+)
+from .corpus import ensure_tokenized_corpus
+
+__all__ = [
+    "ArithmeticExample",
+    "CanonicalProblem",
+    "DEFAULT_OPS",
+    "GENERATOR_VERSION",
+    "SUPPORTED_OPS",
+    "build_arithmetic_dataset",
+    "collate_sft_batch",
+    "dataset_slug",
+    "encode_sft_example",
+    "encode_sft_split",
+    "ensure_tokenized_corpus",
+    "extract_strict_integer",
+    "load_arithmetic_dataset",
+    "load_or_restore_arithmetic_dataset",
+    "normalize_ops",
+    "prepare_arithmetic_dataset",
+    "save_arithmetic_dataset",
+    "score_arithmetic_completion",
+    "select_stratified_eval_problems",
+    "summarize_arithmetic_dataset",
+]

@@ -2,17 +2,32 @@
 # scripts/train.sh - Tmux-based background training runner with per-run logging
 #
 # Commands:
-#   bash scripts/train.sh [options...]       # Starts training inside tmux session 'train' (auto-attaches if interactive)
-#   bash scripts/train.sh attach             # Attaches to running tmux session
-#   bash scripts/train.sh status             # Checks job status and GPU utilization
-#   bash scripts/train.sh logs               # Streams newest live training log in logs/
-#   bash scripts/train.sh stop               # Gracefully terminates training and saves checkpoint
+#   bash scripts/train.sh [options...]           # Starts Phase 2 pre-training inside tmux session 'train'
+#   bash scripts/train.sh sft [sft options...]   # Starts Phase 4 Arithmetic SFT inside tmux session 'train'
+#   bash scripts/train.sh attach                 # Attaches to running tmux session
+#   bash scripts/train.sh status                 # Checks job status and GPU utilization
+#   bash scripts/train.sh logs                   # Streams newest live training log in logs/
+#   bash scripts/train.sh stop                   # Gracefully terminates training and saves checkpoint
 #
-# Examples:
+# Examples (Phase 2 Pre-Training):
 #   bash scripts/train.sh
 #   bash scripts/train.sh --preset base
-#   bash scripts/train.sh --resume --run-id <RUN_ID>
-#   bash scripts/train.sh --stop-after 1000
+#   bash scripts/train.sh --preset small --stop-after 20
+#   bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
+#
+# Examples (Phase 4 Arithmetic SFT - prepare/inspect data first via scripts/prepare_sft_data.sh):
+#   bash scripts/prepare_sft_data.sh
+#   bash scripts/train.sh sft --preset sft_pilot
+#   bash scripts/train.sh sft --preset sft
+#   bash scripts/train.sh sft --preset sft --context-length 2048
+#   bash scripts/train.sh sft --preset sft --base-run-id <BASE_RUN_ID> --checkpoint-alias latest
+#   bash scripts/train.sh sft --preset sft --max-digits 4
+#   bash scripts/train.sh sft --preset sft --resume --run-id <SFT_RUN_ID>
+#
+# Monitoring & Control:
+#   bash scripts/train.sh status
+#   bash scripts/train.sh logs
+#   bash scripts/train.sh stop
 
 set -euo pipefail
 
@@ -42,22 +57,36 @@ python_command() {
 
 cmd_help() {
     cat <<'EOF'
-Usage: bash scripts/train.sh {start|attach|status|logs|stop|restart|help} [train options...]
+Usage: bash scripts/train.sh {start|sft|attach|status|logs|stop|restart|help} [options...]
 
 Commands:
-  [start] [options...]   Start training in tmux session 'train' (attaches if interactive)
-  attach                 Attach to the running tmux session 'train'
-  status                 Show tmux status, GPU utilization, and recent logs
-  logs                   Follow newest run log in logs/ without attaching to tmux
-  stop                   Send Ctrl+C so training saves a checkpoint before closing tmux
-  restart [options...]   Stop any active run and start a new tmux training run
-  help                   Show this help message and src/main.py options
+  [start] [options...]       Start Phase 2 pre-training in tmux session 'train' (attaches if interactive)
+  sft [sft options...]       Start Phase 4 Arithmetic SFT in tmux session 'train'
+  attach                     Attach to the running tmux session 'train'
+  status                     Show tmux status, GPU utilization, and recent logs
+  logs                       Follow newest run log in logs/ without attaching to tmux
+  stop                       Send Ctrl+C so training saves a checkpoint before closing tmux
+  restart [options...]       Stop any active run and start a new tmux run
+  help                       Show this help message and src/main.py options
+
+Examples:
+  bash scripts/train.sh --preset base
+  bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
+  bash scripts/prepare_sft_data.sh
+  bash scripts/train.sh sft --preset sft_pilot
+  bash scripts/train.sh sft --preset sft
+  bash scripts/train.sh sft --preset sft --context-length 2048
+  bash scripts/train.sh sft --preset sft --resume --run-id <SFT_RUN_ID>
 EOF
     echo ""
     local py_cmd
     py_cmd=$(python_command)
     cd "$project_dir"
     eval "$py_cmd src/main.py --help"
+    echo ""
+    eval "$py_cmd src/main.py prepare-sft-data --help"
+    echo ""
+    eval "$py_cmd src/main.py sft --help"
 }
 
 cmd_start() {

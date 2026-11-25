@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory, mkdtemp
@@ -13,9 +14,10 @@ from mlflow import MlflowClient
 from mlflow.exceptions import MlflowException
 import torch
 
-from .checkpoint_store import CheckpointStore, delete_azure_blobs, list_azure_run_blobs
+from .azure_blob import container_client
+from .checkpoint_store import _FILENAME, CheckpointStore, delete_azure_blobs, experiment_checkpoint_prefix, list_azure_run_blobs
 from .metrics import databricks_host
-from .settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT
+from ..settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT
 
 
 class TeeLogger:
@@ -171,6 +173,67 @@ def download_checkpoint(store: CheckpointStore, alias: str = "latest"):
         path = Path(directory) / "checkpoint.pt"
         store.download(alias, path)
         yield path
+
+
+def discover_azure_runs(
+    container: str = AZURE_CONTAINER,
+    *,
+    experiment: str = MLFLOW_EXPERIMENT,
+    preferred_stages: tuple[str, ...] | None = None,
+) -> list[dict]:
+    """List checkpoint runs in Azure prioritized by active MLflow state, optional stage, and recency."""
+    exp_prefix = experiment_checkpoint_prefix(experiment)
+    run_pattern = re.compile(rf"^{re.escape(exp_prefix)}([A-Za-z0-9_-]+)/([^/]+)$")
+    runs_info: dict[str, dict] = {}
+    client = container_client(container)
+    for blob in client.list_blobs(name_starts_with=exp_prefix):
+        match = run_pattern.match(blob.name)
+        if not match:
+            continue
+        rid, fname = match.groups()
+        if not _FILENAME.fullmatch(fname):
+            continue
+        entry = runs_info.setdefault(rid, {"count": 0, "last_modified": blob.last_modified})
+        entry["count"] += 1
+        if blob.last_modified and (entry["last_modified"] is None or blob.last_modified > entry["last_modified"]):
+            entry["last_modified"] = blob.last_modified
+
+    mlflow_states: dict[str, str] = {}
+    mlflow_stages: dict[str, str] = {}
+    if os.getenv("DATABRICKS_HOST", "").strip() and os.getenv("DATABRICKS_TOKEN", "").strip():
+        try:
+            mlflow.set_tracking_uri("databricks")
+            ml_client = MlflowClient(tracking_uri="databricks")
+            for rid in runs_info:
+                try:
+                    run = ml_client.get_run(rid)
+                    mlflow_states[rid] = str(run.info.lifecycle_stage).lower()
+                    mlflow_stages[rid] = str(run.data.tags.get("stage", "pretrain")).lower()
+                except Exception:
+                    mlflow_states[rid] = "unknown"
+        except Exception:
+            pass
+
+    def sort_key(item):
+        rid, info = item
+        is_active = 1 if mlflow_states.get(rid, "active") == "active" else 0
+        if preferred_stages is not None:
+            stage_rank = 1 if mlflow_stages.get(rid, "pretrain") in preferred_stages else 0
+        else:
+            stage_rank = 1
+        ts = info["last_modified"].timestamp() if info["last_modified"] else 0.0
+        return (is_active, stage_rank, ts)
+
+    results = []
+    for rid, info in sorted(runs_info.items(), key=sort_key, reverse=True):
+        results.append({
+            "run_id": rid,
+            "mlflow_state": mlflow_states.get(rid, "unverified"),
+            "mlflow_stage": mlflow_stages.get(rid, "pretrain"),
+            "blob_count": info["count"],
+            "last_modified": info["last_modified"],
+        })
+    return results
 
 
 def inspect_azure_runs(

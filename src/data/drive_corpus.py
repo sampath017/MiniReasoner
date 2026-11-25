@@ -10,7 +10,7 @@ import sys
 import sysconfig
 from tempfile import TemporaryDirectory
 
-from .tokenizer import (
+from ..core.tokenizer import (
     OUTPUT_FILES, prepared_corpus_manifest, publish_prepared_corpus, sha256, verify_corpus_files,
 )
 
@@ -180,3 +180,53 @@ def load_raw_training_stories(
         parquet.replace(source)
         (stage / marker.name).replace(marker)
     return dataset
+
+
+SFT_FILES = ("train.jsonl", "val.jsonl", "test.jsonl", "manifest.json")
+
+
+def _sft_digests(manifest: dict) -> dict[str, str]:
+    files_info = manifest.get("files", {})
+    return {name: files_info[name]["sha256"] for name in ("train.jsonl", "val.jsonl", "test.jsonl")}
+
+
+def publish_sft_dataset(drive_data_root: str, directory: Path, manifest: dict) -> str:
+    """Publish a prepared SFT dataset directory cleanly to Google Drive with SHA-256 verification."""
+    saved_manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    if saved_manifest != manifest:
+        raise ValueError(f"SFT manifest on disk does not match {directory}.")
+    digests = _sft_digests(manifest)
+    for name, expected in digests.items():
+        if sha256(directory / name) != expected:
+            raise ValueError(f"SFT file {directory / name} fails SHA-256 check.")
+    remote = f"{drive_data_root.rstrip('/')}/sft/{directory.name}"
+    _publish(remote, directory, manifest, digests)
+    return remote
+
+
+def reuse_sft_dataset(drive_data_root: str, directory: Path, expected_identity: dict) -> dict | None:
+    """Restore a prepared SFT dataset from Google Drive into `directory` if present and matching."""
+    remote = f"{drive_data_root.rstrip('/')}/sft/{directory.name}"
+    manifest, files = _remote_state(remote)
+    if manifest is None:
+        return None
+    if any(manifest.get(k) != v for k, v in expected_identity.items()):
+        raise ValueError(f"The SFT dataset in {remote} uses different settings.")
+    missing = set(SFT_FILES).difference(files)
+    if missing:
+        raise FileNotFoundError(f"Incomplete Google Drive SFT dataset in {remote}. Missing {', '.join(sorted(missing))}.")
+    print(f"Restoring prepared SFT dataset from {remote}...", flush=True)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".restore-sft-", dir=directory.parent) as temporary:
+        stage = Path(temporary) / directory.name
+        stage.mkdir()
+        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        digests = _sft_digests(manifest)
+        for name, expected_sha in digests.items():
+            _rclone("copyto", f"{remote}/{name}", str(stage / name))
+            if sha256(stage / name) != expected_sha:
+                raise ValueError(f"Downloaded SFT split {name} disagrees with Drive manifest checksum.")
+        if directory.exists():
+            shutil.rmtree(directory)
+        stage.replace(directory)
+    return manifest

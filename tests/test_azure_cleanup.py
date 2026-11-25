@@ -18,9 +18,10 @@ from mlflow.exceptions import MlflowException, RestException
 import numpy as np
 import torch
 
-from src import azure_blob, checkpoint_store, tracking, train
-from src.main import build_cleanup_parser, build_train_parser
+from src.infra import azure_blob, checkpoint_store, tracking
+from src.main import build_cleanup_parser, build_prepare_sft_data_parser, build_sft_parser, build_train_parser
 from src.settings import PRESETS
+from src.training import pretrain
 
 
 class _FakeBlob:
@@ -163,13 +164,23 @@ def test_transient_mlflow_error_aborts_cleanly():
 
 
 def test_cli_parsers():
-    """Verify train and cleanup argument parsers remain clean and compatible."""
+    """Verify train, prepare-sft-data, sft, and cleanup argument parsers remain clean and compatible."""
     train_args = build_train_parser().parse_args(["--preset", "small", "--stop-after", "5"])
     assert train_args.preset == "small" and train_args.stop_after == 5
 
+    prep_args = build_prepare_sft_data_parser().parse_args([
+        "--ops", "add", "sub", "mul", "div", "mod", "--max-digits", "4", "--val-fraction", "0.1", "--nonnegative-only", "--no-drive",
+    ])
+    assert prep_args.max_digits == 4 and prep_args.val_fraction == 0.1 and prep_args.nonnegative_only and prep_args.no_drive
+
+    sft_args = build_sft_parser().parse_args([
+        "--preset", "sft_pilot", "--max-digits", "4", "--nonnegative-only", "--context-length", "2048", "--no-retention",
+    ])
+    assert sft_args.preset == "sft_pilot" and sft_args.max_digits == 4 and sft_args.context_length == 2048 and sft_args.no_retention
+
     cleanup_args = build_cleanup_parser().parse_args(["--delete", "--yes", "--include-missing"])
     assert cleanup_args.delete and cleanup_args.yes and cleanup_args.include_missing
-    print("  [PASSED] CLI train & cleanup argument parsers")
+    print("  [PASSED] CLI train, prepare-sft-data, sft & cleanup argument parsers")
 
 
 class _FakeRunHandle:
@@ -280,13 +291,14 @@ def test_single_local_log_and_remote_upload_in_run_training():
             patch.dict("os.environ", {"DATABRICKS_HOST": "https://example.cloud.databricks.com", "DATABRICKS_TOKEN": "tok"}),
             patch.object(azure_blob, "container_client", return_value=container),
             patch.object(checkpoint_store, "container_client", return_value=container),
+            patch("src.training.pretrain.TOKENIZED_DATA_DIR", tok_dir),
             patch("src.settings.TOKENIZED_DATA_DIR", tok_dir),
             patch("src.settings.VOCAB_SIZE", 256),
-            patch("src.settings.PRESETS", {"small": small_preset}),
-            patch("src.train.ensure_tokenized_corpus", return_value=manifest),
-            patch("src.metrics.track_run", fake_track_run),
+            patch("src.training.pretrain.PRESETS", {"small": small_preset}),
+            patch("src.training.pretrain.ensure_tokenized_corpus", return_value=manifest),
+            patch("src.training.common.track_run", fake_track_run),
         ):
-            result = train.run_training(
+            result = pretrain.run_training(
                 preset="small",
                 device=torch.device("cpu"),
                 logs_dir=logs_dir,

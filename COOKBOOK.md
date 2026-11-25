@@ -31,6 +31,7 @@ Copy your local `.env` to `/home/MiniReasoner/.env` (`chmod 600`, LF line ending
 ```bash
 uv run python tests/test_rope_upgrade.py
 uv run python tests/test_azure_cleanup.py
+uv run python tests/test_sft.py
 uv run python src/main.py --help
 ```
 
@@ -43,7 +44,7 @@ Confirm:
 
 ## Phase 1 · Corpus Preparation & Tokenizer (`SimpleStories`)
 
-Implemented in [src/tokenizer.py](src/tokenizer.py), [src/drive_corpus.py](src/drive_corpus.py), and `ensure_tokenized_corpus()` in [src/train.py](src/train.py):
+Implemented in [src/core/tokenizer.py](src/core/tokenizer.py), [src/data/drive_corpus.py](src/data/drive_corpus.py), and `ensure_tokenized_corpus()` in [src/data/corpus.py](src/data/corpus.py):
 
 1. **Deterministic Hash Split (`story_hash_v1`)**:
    - **Dataset Snapshot:** [`SimpleStories/SimpleStories`](https://huggingface.co/datasets/SimpleStories/SimpleStories) ([arXiv:2504.09184](https://arxiv.org/abs/2504.09184)), Hugging Face commit SHA **`e63b8adc3b1a1bdc7cac5b500d150b71346b0628`** (`2025-12-19 02:08:07 UTC`, `2,115,696` source `train` rows).
@@ -126,19 +127,37 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 
 ## Phase 4 · Arithmetic Supervised Fine-Tuning (SFT)
 
-### 4.1 Problem Design & Leakage Prevention
-- Start with addition and subtraction over nonnegative **1- and 2-digit operands** (covering zero, equal operands, carries, and borrows; nonnegative results first; track negatives, longer operands, multiplication, and short word problems separately later).
+### 4.1 Problem Design, Generation & Inspection (`scripts/prepare_sft_data.sh`)
+- **Operations & Range:** Defaults to **all four operations** (`add`, `sub`, `mul`, `div` — exact integer division; optional `mod` remainder) over **signed integers up to 3 digits** (`-999..999`, covering negatives, zeros, carries, and borrows), scalable to `4+` digits (`--max-digits 4`).
 - Build answers using exact Python integer arithmetic.
-- **Deduplicated Splits:** Split by the underlying canonical problem **before** generating wording variants: keep `7 + 8`, `8 + 7`, and `"What is seven plus eight?"` in the same split (preserve order for subtraction). Maintain three disjoint splits: SFT/RL train, development, and a sealed final test set (recording generator version, split seed, and category counts).
-- Standardize prompt/target format, e.g. `What is 47 + 8?\nAnswer:` → `55<|eos|>`.
+- **Deduplicated Splits:** Split by the underlying canonical problem **before** generating wording variants: keep `7 + 8`, `8 + 7`, and `"What is seven plus eight?"` (and `7 * 8` vs `8 * 7`) in the same split while preserving order for `sub`/`div`/`mod`. Maintain three disjoint splits: `train.jsonl`, `val.jsonl` (validation during SFT), and sealed `test.jsonl` (reserved strictly for final release testing).
+- Standardize prompt/target format, e.g. `What is 47 + 8?\nAnswer:` → `55<|eos|>` and `What is -144 / 12?\nAnswer:` → `-12<|eos|>`.
+- **Generate, Inspect & Cache First (Separate from Training):**
+  ```bash
+  # Generate default 3-digit signed all-4-op splits, print preview, save to data/sft/, and cache to Google Drive
+  bash scripts/prepare_sft_data.sh
 
-### 4.2 SFT Training Protocol
-- Initialize from the chosen Phase 3 base checkpoint (`weights` + `tokenizer_json`); start a **fresh optimizer** and **new MLflow run** tagged with the parent base run ID and checkpoint step.
-- **Optional Context Extension (`1,024 → 2,048`):** Because pre-training uses RoPE (`theta = 10000.0`) from the start, SFT can extend `context_length` up to **`2,048` tokens** if longer multi-step reasoning or chain-of-thought traces require extra headroom.
+  # Custom options (e.g. 4 digits, include remainder 'mod', or skip Drive upload locally)
+  bash scripts/prepare_sft_data.sh --max-digits 4 --ops add sub mul div mod
+  bash scripts/prepare_sft_data.sh --no-drive
+  ```
+
+### 4.2 SFT Training Protocol (`src/data/arithmetic.py`, `src/training/sft.py`)
+- Training reads the inspected dataset from `data/sft/` (or automatically restores & SHA-256 verifies it from Google Drive `gdrive:MiniReasoner/data/sft/`).
+- Initialize from the chosen Phase 3 base checkpoint (`--checkpoint-alias latest` by default, or `best`/`--base-checkpoint`), using a **fresh optimizer** and **new MLflow run** tagged with `stage="sft"`, `parent_run_id`, and `parent_checkpoint_step`.
+- **Optional Context Extension (`1,024 → 2,048`):** Keeps `1,024` by default; pass `--context-length 2048` whenever multi-step reasoning traces need extra context headroom.
 - Mask cross-entropy loss on the prompt tokens (`-100`) and compute loss **only on the answer + `<|eos|>`**.
-- Mix or monitor a small SimpleStories retention slice alongside arithmetic SFT so narrative coherence does not collapse.
-- Run a small pilot first; inspect failure modes (operand copying, missed carries/borrows, trailing gibberish past the number), expand demonstrations in weak categories, and repeat dev comparisons.
-- **Promotion Gate:** Promote the best SFT checkpoint as the reference model for Phase 5. If SFT already achieves near-ceiling accuracy on 1–2 digits, escalate difficulty (e.g., 3-digit carries, chained operations, or short word problems) before spending GPU budget on RL.
+- Mix a SimpleStories retention slice (`--retention-ratio 0.1`, or `--no-retention` when running isolated dry/pilot tests) and evaluate during training **only on `val`** (`val_arith_loss`, per-operation & per-category greedy `val_exact_match`, and `story_val_loss`), keeping `test.jsonl` sealed until Phase 6.
+- Run a small pilot first, inspect per-category failure modes, expand demonstrations, and promote:
+  ```bash
+  # Run fast pilot in tmux
+  bash scripts/train.sh sft --preset sft_pilot
+
+  # Full Phase 4 run (or extend context to 2048 tokens)
+  bash scripts/train.sh sft --preset sft
+  bash scripts/train.sh sft --preset sft --context-length 2048
+  ```
+- **Promotion Gate:** Promote the best SFT checkpoint as the reference model for Phase 5. If SFT already achieves near-ceiling accuracy on 3-digit problems, escalate difficulty (`--max-digits 4` or short word problems) before spending GPU budget on RL.
 
 ---
 
@@ -150,7 +169,7 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
   - Award **`1.0`** only if the completion contains **strictly one valid integer** matching the ground-truth answer, cleanly terminated by `<|eos|>` (or agreed stop) with no extra guesses, conflicting numbers, or story drift.
   - Award **`0.0`** otherwise (explicitly test the verifier on `0`, negative signs if enabled, multiple numbers, whitespace, and empty outputs).
 - Focus RL prompts on categories where SFT produces mixed groups (both right and wrong rollouts provide gradient variance). Keep KL regularization against the frozen SFT reference and monitor mean answer length, invalid-format rate, held-out greedy arithmetic accuracy, and story retention.
-- **Promotion Gate:** Run paired greedy evaluation (`RL` vs. `SFT` on identical dev problems), counting wins (`RL fixed`) vs. regressions (`RL broke`) by category. Promote RL only if gains clearly exceed paired noise without degrading story quality beyond tolerance.
+- **Promotion Gate:** Run paired greedy evaluation (`RL` vs. `SFT` on identical val problems), counting wins (`RL fixed`) vs. regressions (`RL broke`) by category. Promote RL only if gains clearly exceed paired noise without degrading story quality beyond tolerance.
 
 ---
 
@@ -171,5 +190,5 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 | --- | --- | --- |
 | 25 Nov 2026 | Run `23a72f3a...` (`1,024` ctx, `RoPE`) finished 1 full epoch (`26,047` steps): best val **`1.1302`** at Step `25,000`, final **`1.1303`** at Step `26,047` | Promote `RoPE` `1,024`-ctx base model (extensible up to `2,048` for SFT); evaluate Step `25,000` vs `26,047` in `evaluation.ipynb` |
 | Phase 3 (Next) | Held-out SimpleStories test PPL/BPB, 4-choice Story Cloze accuracy, RoPE position-bucket scaling (`1–1,024`), and pre-SFT arithmetic baseline | Lock base checkpoint, clean up deleted MLflow Azure blobs (`c26cf6e5...`), and record pre-SFT baseline |
-| Phase 4 (Planned) | Dev arithmetic accuracy by category + story retention after SFT pilot | Expand SFT demonstrations, move to GRPO pilot, or escalate problem difficulty |
-| Phase 5–6 (Planned) | Paired GRPO vs. SFT dev wins/regressions, sealed arithmetic test, final CPU load check | Select final release checkpoint and archive provenance |
+| Phase 4 (Planned) | Val arithmetic accuracy by category + story retention after SFT pilot | Expand SFT demonstrations, move to GRPO pilot, or escalate problem difficulty |
+| Phase 5–6 (Planned) | Paired GRPO vs. SFT val wins/regressions, sealed arithmetic test, final CPU load check | Select final release checkpoint and archive provenance |

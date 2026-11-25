@@ -105,6 +105,7 @@ Jarvis setup installs `tmux` and checks that it can list Google Drive using the 
 | --- | --- |
 | Google Drive · `My Drive/MiniReasoner/data/raw/` | SimpleStories training text saved during fresh preparation |
 | Google Drive · `My Drive/MiniReasoner/data/tokenized/full-val-0.01/` | Tokenizer, packed training and validation tokens, and their manifest |
+| Google Drive · `My Drive/MiniReasoner/data/sft/` | Prepared Phase 4 arithmetic SFT `train`/`val`/`test` splits and checksum manifests |
 | Azure · `minireasoner/checkpoints/Shared/MiniReasoner/<run-id>/` | Checkpoints (`step-*.pt`) and run logs (`logs/train_<TIMESTAMP>_<PRESET>.log`) |
 | Databricks · `/Shared/MiniReasoner` | Per-run curves, settings, `logs/` artifacts, and Azure checkpoint/log tags |
 | Local VM · `logs/` | One local log per run (`logs/train_<TIMESTAMP>_<PRESET>.log`, no local aliases) |
@@ -127,4 +128,4 @@ uv run python src/main.py cleanup --delete
 
 ## CPU inference
 
-Open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to select the latest Azure run's lowest-loss checkpoint, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.generate.complete()` directly from Python.
+Open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to select the latest Azure run's lowest-loss checkpoint, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.core.generate.complete()` directly from Python.
