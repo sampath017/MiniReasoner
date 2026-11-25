@@ -58,6 +58,10 @@ class TrainingRun:
     def set_tag(self, key: str, value: str) -> None:
         self._client.set_tag(self.id, key, value, synchronous=True)
 
+    def log_artifact(self, path, artifact_path: str = "logs") -> None:
+        """Upload a file artifact to the tracked Databricks MLflow run."""
+        self._client.log_artifact(self.id, str(path), artifact_path=artifact_path)
+
 
 @contextmanager
 def track_run(tracking_uri: str, experiment_name: str, config: dict, *, run_id: str | None = None):

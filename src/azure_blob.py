@@ -40,12 +40,12 @@ class AzureBlobFiles:
         names = (name.removeprefix(self.prefix) for name in blobs)
         return [name for name in names if name and "/" not in name]
 
-    def put(self, path: Path, name: str, *, digest: str | None = None) -> None:
+    def put(self, path: Path, name: str, *, digest: str | None = None, overwrite: bool = False) -> None:
         digest = digest or sha256(path)
         blob = self.container.get_blob_client(self.prefix + name)
         try:
             with path.open("rb") as stream:
-                blob.upload_blob(stream, overwrite=False, metadata={"sha256": digest})
+                blob.upload_blob(stream, overwrite=overwrite, metadata={"sha256": digest})
         except ResourceExistsError:
             # Retrying an upload whose commit succeeded is safe for identical data.
             saved = blob.get_blob_properties()

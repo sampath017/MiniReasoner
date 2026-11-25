@@ -115,6 +115,18 @@ class CheckpointStore:
         self.prune()
         return name
 
+    def save_log(self, path: Path, *, name: str | None = None) -> str:
+        """Upload or update a training log file under `<run_id>/logs/<filename>` in Azure."""
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Training log file not found: {path}")
+        filename = Path(name or path.name).name
+        if not filename or filename in (".", ".."):
+            raise ValueError("A run log needs a valid filename.")
+        blob_name = f"logs/{filename}"
+        self.files.put(path, blob_name, overwrite=True)
+        return blob_name
+
     def prune(self) -> None:
         if self.keep is None:
             return

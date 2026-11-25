@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -7,6 +8,7 @@ import torch
 from torch.nn import functional as F
 
 from .tokenizer import TOKEN_DTYPE
+from .tracking import TeeLogger, tee_to_log  # noqa: F401 - re-exported for callers/tests
 
 
 @dataclass(frozen=True)
@@ -325,24 +327,6 @@ def ensure_tokenized_corpus(
     return manifest
 
 
-class TeeLogger:
-    def __init__(self, stream, file):
-        self.stream = stream
-        self.file = file
-
-    def write(self, data):
-        self.stream.write(data)
-        self.file.write(data)
-        self.file.flush()
-
-    def flush(self):
-        self.stream.flush()
-        self.file.flush()
-
-    def isatty(self):
-        return getattr(self.stream, "isatty", lambda: False)()
-
-
 def run_training(
     *,
     preset: str = "base",
@@ -357,11 +341,11 @@ def run_training(
     tokenizer_device: str = "auto",
     loss_decimals: int = 4,
     device: torch.device | None = None,
+    logs_dir: Path | None = None,
 ) -> dict:
     from dataclasses import asdict
     from datetime import datetime
     import os
-    import shutil
     import signal
     import sys
     from time import perf_counter
@@ -376,42 +360,24 @@ def run_training(
         VALIDATION_FRACTION, VOCAB_SIZE,
     )
     from .tokenizer import TOKEN_DTYPE, verify_corpus_files
-    from .tracking import checkpoint_uploads, download_checkpoint
+    from .tracking import checkpoint_uploads, download_checkpoint, publish_run_log
 
     project_root = Path(__file__).resolve().parent.parent
     load_dotenv(project_root / ".env")
 
-    # Setup per-run logging to logs/
-    logs_dir = project_root / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    # Write strictly one local log file per run under logs/ (no local aliases/symlinks).
+    resolved_logs_dir = Path(logs_dir) if logs_dir is not None else project_root / "logs"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"train_{timestamp}_{preset}.log"
-    log_path = logs_dir / log_filename
-    latest_path = logs_dir / "latest.log"
-    log_file = log_path.open("a", encoding="utf-8")
-
-    # Point latest.log to the active run log immediately so `tail -f logs/latest.log` works live.
-    using_latest_symlink = False
-    try:
-        if latest_path.is_symlink() or latest_path.exists():
-            latest_path.unlink()
-        latest_path.symlink_to(log_filename)
-        using_latest_symlink = True
-    except OSError:
-        pass
-
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    sys.stdout = TeeLogger(orig_stdout, log_file)
-    sys.stderr = TeeLogger(orig_stderr, log_file)
+    log_path = resolved_logs_dir / f"train_{timestamp}_{preset}.log"
 
     prev_sigint = signal.getsignal(signal.SIGINT)
     prev_sigterm = signal.getsignal(signal.SIGTERM)
-    run_id_log_path: Path | None = None
-    using_run_id_symlink = False
 
-    try:
-        print(f"Logging run to {log_path} (latest: {latest_path})", flush=True)
+    with ExitStack() as stack:
+        stack.callback(signal.signal, signal.SIGTERM, prev_sigterm)
+        stack.callback(signal.signal, signal.SIGINT, prev_sigint)
+        log_lock = stack.enter_context(tee_to_log(log_path))
+        print(f"Logging run to {log_path}", flush=True)
 
         if preset not in PRESETS:
             raise ValueError(f"Unknown preset {preset!r}. Choose from: {list(PRESETS.keys())}")
@@ -550,140 +516,137 @@ def run_training(
             run_id=mlflow_run_id if resume else None,
         ) as run:
             active_run_id = run.id
-            run_id_log_path = logs_dir / f"train_{active_run_id}.log"
-            try:
-                if run_id_log_path.is_symlink() or run_id_log_path.exists():
-                    run_id_log_path.unlink()
-                run_id_log_path.symlink_to(log_filename)
-                using_run_id_symlink = True
-            except OSError:
-                pass
             store = CheckpointStore(azure_container, active_run_id)
             store.prepare()
             run.set_tag("checkpoint_location", store.location)
             print(f"MLflow run ID: {active_run_id} | Azure checkpoints: {store.location}", flush=True)
 
-            if resume:
-                store.prune()
-                for row in history:
-                    run.log(row, step=row["step"])
-                if history:
-                    val_loss = history[-1].get("val_loss", val_loss)
-            else:
-                print("Evaluating validation loss at step 0 before first training batch...", flush=True)
-                initial_loss = evaluate(model, val_data, config, device, precision, step=0)
-                val_loss = initial_loss
-                history = [{"step": 0, "tokens": 0, "val_loss": initial_loss, "val_targets": val_targets_per_check}]
-                print(f"Step 0 | mean train loss N/A | validation loss {initial_loss:.{loss_decimals}f}", flush=True)
-                run.log(history[0], step=0)
+            run_failed = False
+            try:
+                if resume:
+                    store.prune()
+                    for row in history:
+                        run.log(row, step=row["step"])
+                    if history:
+                        val_loss = history[-1].get("val_loss", val_loss)
+                else:
+                    print("Evaluating validation loss at step 0 before first training batch...", flush=True)
+                    initial_loss = evaluate(model, val_data, config, device, precision, step=0)
+                    val_loss = initial_loss
+                    history = [{"step": 0, "tokens": 0, "val_loss": initial_loss, "val_targets": val_targets_per_check}]
+                    print(f"Step 0 | mean train loss N/A | validation loss {initial_loss:.{loss_decimals}f}", flush=True)
+                    run.log(history[0], step=0)
 
-            with checkpoint_uploads(store, run) as save_checkpoint:
-                interval_start = perf_counter()
-                interval_start_targets = sampler.targets_through(start)
-                interval_loss_sum = 0.0
-
-                for step in range(start + 1, stop + 1):
-                    if stop_requested:
-                        print(f"Stopping early as requested at step {last_step:,}.", flush=True)
-                        break
-
-                    lr = config.lr_at(step)
-                    for group in optimizer.param_groups:
-                        group["lr"] = lr
-                    optimizer.zero_grad(set_to_none=True)
-
-                    starts = sampler.starts(step)
-                    x, y = streams["train"].batch(starts, device)
-                    loss = loss_for(model, x, y, precision)
-                    tokens_seen = sampler.targets_through(step)
-                    batch_targets = tokens_seen - sampler.targets_through(step - 1)
-
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    last_step = step
-
-                    train_loss = loss.detach().item()
-                    if not math.isfinite(train_loss):
-                        raise FloatingPointError(f"Non-finite training loss at step {step}.")
-                    print(f"Step {step:,} | train loss {train_loss:.{loss_decimals}f}", flush=True)
-                    interval_loss_sum += train_loss * batch_targets
-
-                    metrics = {"step": step, "train_loss": train_loss}
-                    is_eval_step = (step % config.eval_every == 0) or (step == stop) or stop_requested
-                    if not is_eval_step:
-                        run.log(metrics, step=step)
-                        continue
-
-                    interval_targets = tokens_seen - interval_start_targets
-                    interval_mean = interval_loss_sum / interval_targets
-                    throughput = interval_targets / max(1e-6, perf_counter() - interval_start)
-                    val_loss = evaluate(model, val_data, config, device, precision, step=step)
-                    if not math.isfinite(val_loss):
-                        raise FloatingPointError(f"Non-finite validation loss at step {step}.")
-
-                    print(
-                        f"Step {step:,} | mean train loss {interval_mean:.{loss_decimals}f} | "
-                        f"validation loss {val_loss:.{loss_decimals}f} | {round(throughput):,} tok/s",
-                        flush=True,
-                    )
-                    metrics.update({
-                        "tokens": tokens_seen,
-                        "epoch": tokens_seen / streams["train"].target_count,
-                        "train_loss_interval_mean": interval_mean,
-                        "val_loss": val_loss,
-                        "val_targets": val_targets_per_check,
-                        "lr": lr,
-                        "train_tokens_per_second": round(throughput),
-                    })
-                    run.log(metrics, step=step)
-                    history.append(metrics)
-
-                    print(f"Saving checkpoint snapshot at step {step:,}...", flush=True)
-                    save_checkpoint(
-                        {
-                            "version": 1,
-                            **run_identity,
-                            "step": step,
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "tokenizer_json": tokenizer_json,
-                            "metrics": history,
-                        },
-                    )
-                    interval_loss_sum = 0.0
-                    interval_start_targets = tokens_seen
+                with checkpoint_uploads(store, run, log_path=log_path, log_lock=log_lock) as save_checkpoint:
                     interval_start = perf_counter()
+                    interval_start_targets = sampler.targets_through(start)
+                    interval_loss_sum = 0.0
 
-                    if stop_requested:
-                        print(f"Stopping early after saving checkpoint at step {last_step:,}.", flush=True)
-                        break
+                    for step in range(start + 1, stop + 1):
+                        if stop_requested:
+                            print(f"Stopping early as requested at step {last_step:,}.", flush=True)
+                            break
 
-        status = "Completed" if not stop_requested and last_step >= config.steps else "Stopped"
-        print(f"Training {status} at step {last_step:,}. Final train loss: {train_loss:.{loss_decimals}f}, val loss: {val_loss:.{loss_decimals}f}", flush=True)
+                        lr = config.lr_at(step)
+                        for group in optimizer.param_groups:
+                            group["lr"] = lr
+                        optimizer.zero_grad(set_to_none=True)
+
+                        starts = sampler.starts(step)
+                        x, y = streams["train"].batch(starts, device)
+                        loss = loss_for(model, x, y, precision)
+                        tokens_seen = sampler.targets_through(step)
+                        batch_targets = tokens_seen - sampler.targets_through(step - 1)
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        last_step = step
+
+                        train_loss = loss.detach().item()
+                        if not math.isfinite(train_loss):
+                            raise FloatingPointError(f"Non-finite training loss at step {step}.")
+                        print(f"Step {step:,} | train loss {train_loss:.{loss_decimals}f}", flush=True)
+                        interval_loss_sum += train_loss * batch_targets
+
+                        metrics = {"step": step, "train_loss": train_loss}
+                        is_eval_step = (step % config.eval_every == 0) or (step == stop) or stop_requested
+                        if not is_eval_step:
+                            run.log(metrics, step=step)
+                            continue
+
+                        interval_targets = tokens_seen - interval_start_targets
+                        interval_mean = interval_loss_sum / interval_targets
+                        throughput = interval_targets / max(1e-6, perf_counter() - interval_start)
+                        val_loss = evaluate(model, val_data, config, device, precision, step=step)
+                        if not math.isfinite(val_loss):
+                            raise FloatingPointError(f"Non-finite validation loss at step {step}.")
+
+                        print(
+                            f"Step {step:,} | mean train loss {interval_mean:.{loss_decimals}f} | "
+                            f"validation loss {val_loss:.{loss_decimals}f} | {round(throughput):,} tok/s",
+                            flush=True,
+                        )
+                        metrics.update({
+                            "tokens": tokens_seen,
+                            "epoch": tokens_seen / streams["train"].target_count,
+                            "train_loss_interval_mean": interval_mean,
+                            "val_loss": val_loss,
+                            "val_targets": val_targets_per_check,
+                            "lr": lr,
+                            "train_tokens_per_second": round(throughput),
+                        })
+                        run.log(metrics, step=step)
+                        history.append(metrics)
+
+                        print(f"Saving checkpoint snapshot at step {step:,}...", flush=True)
+                        save_checkpoint(
+                            {
+                                "version": 1,
+                                **run_identity,
+                                "step": step,
+                                "model": model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "tokenizer_json": tokenizer_json,
+                                "metrics": history,
+                            },
+                        )
+                        interval_loss_sum = 0.0
+                        interval_start_targets = tokens_seen
+                        interval_start = perf_counter()
+
+                        if stop_requested:
+                            print(f"Stopping early after saving checkpoint at step {last_step:,}.", flush=True)
+                            break
+
+                status = "Completed" if not stop_requested and last_step >= config.steps else "Stopped"
+                print(f"Training {status} at step {last_step:,}. Final train loss: {train_loss:.{loss_decimals}f}, val loss: {val_loss:.{loss_decimals}f}", flush=True)
+            except BaseException as error:
+                import traceback
+                run_failed = True
+                print(f"\nTraining aborted due to {type(error).__name__}: {error}", flush=True)
+                traceback.print_exc()
+                raise
+            finally:
+                run.flush()
+                azure_log_uri = f"{store.location}/logs/{log_path.name}"
+                print(f"Uploading run log to Azure ({azure_log_uri}) and Databricks MLflow...", flush=True)
+                try:
+                    publish_run_log(store, log_path, run, lock=log_lock)
+                except Exception as error:
+                    if run_failed:
+                        print(f"Warning: could not upload run log during failure cleanup ({error}).", flush=True)
+                    else:
+                        raise
+
         return {
             "status": status,
             "step": last_step,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "mlflow_run_id": active_run_id,
+            "log_path": str(log_path),
         }
-    finally:
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        log_file.close()
-        if not using_latest_symlink:
-            try:
-                shutil.copyfile(log_path, latest_path)
-            except Exception:
-                pass
-        if run_id_log_path is not None and not using_run_id_symlink:
-            try:
-                shutil.copyfile(log_path, run_id_log_path)
-            except Exception:
-                pass
-        signal.signal(signal.SIGINT, prev_sigint)
-        signal.signal(signal.SIGTERM, prev_sigterm)
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -1,6 +1,8 @@
 # MiniReasoner
 
-MiniReasoner is a decoder-only Transformer trained to predict the next token in English SimpleStories. It uses the full published training split, with approximately 99% of stories for training and 1% held out for validation. The byte-level BPE tokenizer learns only from training stories, uses a target vocabulary of 1,024 tokens, and keeps digits separate. [Dataset](https://huggingface.co/datasets/SimpleStories/SimpleStories)
+MiniReasoner is a decoder-only Transformer trained to predict the next token in English SimpleStories. It uses the full published training split, with approximately 99% of stories for training and 1% held out for validation (`2,094,643` train stories / `853,498,695` tokens; `21,053` val stories / `8,598,126` tokens). The byte-level BPE tokenizer learns only from training stories, uses a target vocabulary of 1,024 tokens, and keeps digits separate.
+
+- **Dataset Citation:** [SimpleStories/SimpleStories](https://huggingface.co/datasets/SimpleStories/SimpleStories) ([arXiv:2504.09184](https://arxiv.org/abs/2504.09184)) · Hugging Face snapshot commit SHA: `e63b8adc3b1a1bdc7cac5b500d150b71346b0628` (`2,115,696` source `train` rows)
 
 ## Model and training settings
 
@@ -93,7 +95,7 @@ python src/main.py --preset base --resume --run-id <MLFLOW_RUN_ID>
 
 ### Evaluation & Inference Notebook
 
-Use [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) to inspect checkpoints from Azure Blob Storage, plot convergence curves, evaluate perplexity and arithmetic baselines, and generate stories on both CPU and GPU.
+Use [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) to inspect checkpoints from Azure Blob Storage, plot convergence curves, evaluate perplexity/BPB and Story Cloze accuracy, test arithmetic baselines, and generate stories on both CPU and GPU. See [COOKBOOK.md](COOKBOOK.md) for the complete end-to-end build, training, post-training SFT/RL, and release plan.
 
 ## Reuse the corpus and save checkpoints
 
@@ -103,9 +105,9 @@ Jarvis setup installs `tmux` and checks that it can list Google Drive using the 
 | --- | --- |
 | Google Drive · `My Drive/MiniReasoner/data/raw/` | SimpleStories training text saved during fresh preparation |
 | Google Drive · `My Drive/MiniReasoner/data/tokenized/full-val-0.01/` | Tokenizer, packed training and validation tokens, and their manifest |
-| Azure · `minireasoner/checkpoints/Shared/MiniReasoner/<run-id>/` | Snapshots with the model weights, optimizer, tokenizer, and training history |
-| Databricks · `/Shared/MiniReasoner` | Per-run training and validation curves, settings, and the Azure checkpoint location |
-| Local VM · `logs/` | Per-run training logs (`logs/train_<TIMESTAMP>_<PRESET>.log` and `logs/latest.log`) |
+| Azure · `minireasoner/checkpoints/Shared/MiniReasoner/<run-id>/` | Checkpoints (`step-*.pt`) and run logs (`logs/train_<TIMESTAMP>_<PRESET>.log`) |
+| Databricks · `/Shared/MiniReasoner` | Per-run curves, settings, `logs/` artifacts, and Azure checkpoint/log tags |
+| Local VM · `logs/` | One local log per run (`logs/train_<TIMESTAMP>_<PRESET>.log`, no local aliases) |
 
 A fresh VM downloads the prepared corpus from Drive and verifies its file sizes and checksums before training. An existing folder with `manifest.json`, `tokenizer.json`, `train.bin`, and `val.bin` works directly when its manifest matches the corpus settings. The VM reads training batches from its disk cache. If preparation is needed, it reuses raw training stories from Drive or fetches them from Hugging Face, fits BPE on the training portion, and saves the finished corpus to Drive.
 

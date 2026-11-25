@@ -1,10 +1,12 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import os
 from pathlib import Path
+import shutil
 import sys
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory, mkdtemp
+import threading
 
 import mlflow
 from mlflow import MlflowClient
@@ -16,27 +18,116 @@ from .metrics import databricks_host
 from .settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT
 
 
-def publish_checkpoint(store: CheckpointStore, path: Path, metrics: dict, run) -> None:
+class TeeLogger:
+    """Thread-safe stream wrapper mirroring writes identically to console and one log file."""
+
+    def __init__(self, stream, file, lock=None):
+        self.stream = stream
+        self.file = file
+        self.lock = lock if lock is not None else threading.RLock()
+
+    def write(self, data):
+        with self.lock:
+            self.stream.write(data)
+            self.file.write(data)
+            self.file.flush()
+
+    def flush(self):
+        with self.lock:
+            self.stream.flush()
+            self.file.flush()
+
+    def isatty(self):
+        return getattr(self.stream, "isatty", lambda: False)()
+
+
+@contextmanager
+def tee_to_log(log_path: Path | None, lock=None):
+    """Mirror stdout and stderr identically into `log_path` unless already teeing."""
+    if log_path is None or isinstance(sys.stdout, TeeLogger):
+        yield getattr(sys.stdout, "lock", lock)
+        return
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    log_lock = lock if lock is not None else threading.RLock()
+    log_file = path.open("a", encoding="utf-8")
+    sys.stdout = TeeLogger(orig_stdout, log_file, lock=log_lock)
+    sys.stderr = TeeLogger(orig_stderr, log_file, lock=log_lock)
+    try:
+        yield log_lock
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
+            log_file.close()
+
+
+def _copy_log_snapshot(log_path: Path, directory: Path, *, lock=None) -> Path:
+    """Copy `log_path` into `directory` preserving filename for race-free upload."""
+    guard = lock if lock is not None else nullcontext()
+    snapshot = directory / log_path.name
+    with guard:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        shutil.copyfile(log_path, snapshot)
+    return snapshot
+
+
+def _upload_log_snapshot(store: CheckpointStore, snapshot_path: Path, run) -> dict:
+    """Upload a snapshotted log file to Azure Blob Storage and best-effort to MLflow."""
+    blob_name = store.save_log(snapshot_path, name=snapshot_path.name)
+    log_uri = f"{store.location}/{blob_name}"
+    run.set_tag("log_location", log_uri)
+    mlflow_saved = False
+    if hasattr(run, "log_artifact"):
+        try:
+            run.log_artifact(snapshot_path, artifact_path="logs")
+            mlflow_saved = True
+        except Exception as error:
+            print(f"Warning: could not upload log artifact to MLflow ({error}).", flush=True)
+    return {"azure_uri": log_uri, "mlflow_saved": mlflow_saved}
+
+
+def publish_run_log(store: CheckpointStore, log_path: Path, run, *, lock=None) -> dict:
+    """Snapshot `log_path` safely and upload it to Azure Blob Storage and MLflow."""
+    with TemporaryDirectory(prefix="minireasoner-log-") as directory:
+        snapshot = _copy_log_snapshot(log_path, Path(directory), lock=lock)
+        return _upload_log_snapshot(store, snapshot, run)
+
+
+def publish_checkpoint(
+    store: CheckpointStore, path: Path, metrics: dict, run, *, log_snapshot: Path | None = None,
+) -> None:
     step = metrics["step"]
     store.save(
         path, step=step, val_loss=metrics["val_loss"],
         train_loss_interval_mean=metrics["train_loss_interval_mean"],
     )
     run.set_tag("checkpoint_step", str(step))
+    if log_snapshot is not None:
+        _upload_log_snapshot(store, log_snapshot, run)
     print(f"Saved Azure checkpoint at step {step:,}.", flush=True)
 
 
 @contextmanager
-def checkpoint_uploads(store: CheckpointStore, run):
-    """Queue independent snapshots for ordered upload while training continues."""
-    def upload(path: Path, metrics: dict) -> None:
+def checkpoint_uploads(store: CheckpointStore, run, *, log_path: Path | None = None, log_lock=None):
+    """Queue independent snapshots (and run logs) for ordered upload while training continues."""
+    def upload(path: Path, metrics: dict, log_dir: Path | None, log_snapshot: Path | None) -> None:
         try:
-            publish_checkpoint(store, path, metrics, run)
+            publish_checkpoint(store, path, metrics, run, log_snapshot=log_snapshot)
         except Exception as error:
             raise RuntimeError(
                 f"Could not publish checkpoint at step {metrics['step']:,}. "
                 f"The complete snapshot is available at {path}."
             ) from error
+        finally:
+            if log_dir is not None:
+                shutil.rmtree(log_dir, ignore_errors=True)
         path.unlink()
 
     with ThreadPoolExecutor(max_workers=1) as worker:
@@ -50,14 +141,21 @@ def checkpoint_uploads(store: CheckpointStore, run):
                 prefix=f"minireasoner-step-{metrics['step']}-", suffix=".pt", delete=False,
             )
             path = Path(snapshot.name)
+            log_dir: Path | None = None
+            log_snapshot: Path | None = None
             try:
                 with snapshot:
                     # The model and optimizer tensors still reference live weights.
                     torch.save(checkpoint, snapshot)
+                if log_path is not None and log_path.is_file():
+                    log_dir = Path(mkdtemp(prefix="minireasoner-log-"))
+                    log_snapshot = _copy_log_snapshot(log_path, log_dir, lock=log_lock)
             except BaseException:
                 path.unlink(missing_ok=True)
+                if log_dir is not None:
+                    shutil.rmtree(log_dir, ignore_errors=True)
                 raise
-            pending.append(worker.submit(upload, path, metrics))
+            pending.append(worker.submit(upload, path, metrics, log_dir, log_snapshot))
             print(f"Queued Azure checkpoint at step {metrics['step']:,}.", flush=True)
 
         try:

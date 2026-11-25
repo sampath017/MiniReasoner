@@ -5,7 +5,7 @@
 #   bash scripts/train.sh [options...]       # Starts training inside tmux session 'train' (auto-attaches if interactive)
 #   bash scripts/train.sh attach             # Attaches to running tmux session
 #   bash scripts/train.sh status             # Checks job status and GPU utilization
-#   bash scripts/train.sh logs               # Streams live training logs (tail -f logs/latest.log)
+#   bash scripts/train.sh logs               # Streams newest live training log in logs/
 #   bash scripts/train.sh stop               # Gracefully terminates training and saves checkpoint
 #
 # Examples:
@@ -28,6 +28,10 @@ session_exists() {
     tmux has-session -t "$session_name" 2>/dev/null
 }
 
+latest_log_file() {
+    ls -t "$logs_dir"/*.log 2>/dev/null | head -n 1 || true
+}
+
 python_command() {
     if [[ -x "$project_dir/.venv/bin/python" ]]; then
         printf '%q' "$project_dir/.venv/bin/python"
@@ -44,7 +48,7 @@ Commands:
   [start] [options...]   Start training in tmux session 'train' (attaches if interactive)
   attach                 Attach to the running tmux session 'train'
   status                 Show tmux status, GPU utilization, and recent logs
-  logs                   Follow logs/latest.log without attaching to tmux
+  logs                   Follow newest run log in logs/ without attaching to tmux
   stop                   Send Ctrl+C so training saves a checkpoint before closing tmux
   restart [options...]   Stop any active run and start a new tmux training run
   help                   Show this help message and src/main.py options
@@ -94,7 +98,7 @@ cmd_start() {
     echo "=================================================================="
     echo "MiniReasoner Training Started in tmux session '$session_name'"
     echo "  Session:  $session_name"
-    echo "  Logs:     logs/ (each run logged to a separate file; latest: logs/latest.log)"
+    echo "  Logs:     logs/train_<TIMESTAMP>_<PRESET>.log (one local log per run; uploaded to Azure & MLflow)"
     echo "  Losses:   Formatted to 4 decimal places (.4f)"
     echo "=================================================================="
     echo "To detach from tmux without stopping training: Press Ctrl+B, then D."
@@ -117,6 +121,8 @@ cmd_attach() {
 }
 
 cmd_status() {
+    local latest_log
+    latest_log=$(latest_log_file)
     echo "==================== MiniReasoner Job Status ===================="
     if session_exists; then
         echo "Status: RUNNING inside tmux session '$session_name'"
@@ -128,19 +134,21 @@ cmd_status() {
             nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv 2>/dev/null || true
             echo ""
         fi
-        echo "Recent log output (last 15 lines from logs/latest.log):"
-        echo "------------------------------------------------------------------"
-        if [[ -f "$logs_dir/latest.log" ]]; then
-            tail -n 15 "$logs_dir/latest.log"
+        if [[ -n "$latest_log" && -f "$latest_log" ]]; then
+            local rel_log="${latest_log#"$project_dir/"}"
+            echo "Recent log output (last 15 lines from $rel_log):"
+            echo "------------------------------------------------------------------"
+            tail -n 15 "$latest_log"
+            echo "------------------------------------------------------------------"
         fi
-        echo "------------------------------------------------------------------"
     else
         echo "Status: NOT RUNNING (no tmux session '$session_name')"
-        if [[ -f "$logs_dir/latest.log" ]]; then
+        if [[ -n "$latest_log" && -f "$latest_log" ]]; then
+            local rel_log="${latest_log#"$project_dir/"}"
             echo ""
-            echo "Last 15 lines from previous run (logs/latest.log):"
+            echo "Last 15 lines from previous run ($rel_log):"
             echo "------------------------------------------------------------------"
-            tail -n 15 "$logs_dir/latest.log"
+            tail -n 15 "$latest_log"
             echo "------------------------------------------------------------------"
         fi
     fi
@@ -148,15 +156,13 @@ cmd_status() {
 }
 
 cmd_logs() {
-    local target="$logs_dir/latest.log"
-    if [[ ! -f "$target" ]]; then
-        target=$(ls -t "$logs_dir"/*.log 2>/dev/null | head -n 1 || true)
-    fi
+    local target
+    target=$(latest_log_file)
     if [[ -z "$target" || ! -f "$target" ]]; then
         echo "No log files found in $logs_dir yet."
         exit 1
     fi
-    echo "Streaming $target (Ctrl+C to detach; training continues in tmux)..."
+    echo "Streaming ${target#"$project_dir/"} (Ctrl+C to detach; training continues in tmux)..."
     tail -n 40 -f "$target"
 }
 
