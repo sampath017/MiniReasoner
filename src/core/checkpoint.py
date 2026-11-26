@@ -65,14 +65,21 @@ def build_model_config(checkpoint: dict, *, context_length: int | None = None) -
     return GPTConfig(**cfg_dict)
 
 
-def _discover_active_base_run(container: str, *, experiment: str) -> str:
-    """Pick the newest active base pre-training run from Azure Blob Storage + Databricks MLflow."""
+def _discover_active_base_run(
+    container: str,
+    *,
+    experiment: str,
+    preferred_stages: tuple[str, ...] = ("pretrain", "base", ""),
+    preferred_arith_format: str | None = None,
+) -> str:
+    """Pick the newest active checkpoint run from Azure Blob Storage + Databricks MLflow."""
     from ..infra.tracking import discover_azure_runs
 
     runs = discover_azure_runs(
         container,
         experiment=experiment,
-        preferred_stages=("pretrain", "base", ""),
+        preferred_stages=preferred_stages,
+        preferred_arith_format=preferred_arith_format,
     )
     if not runs:
         raise FileNotFoundError(f"No checkpoints found under {experiment} in Azure container {container!r}.")
@@ -84,6 +91,8 @@ def resolve_base_checkpoint(
     checkpoint_path: Path | None = None,
     run_id: str | None = None,
     alias: str = "latest",
+    preferred_stages: tuple[str, ...] = ("pretrain", "base", ""),
+    preferred_arith_format: str | None = None,
     azure_container: str = AZURE_CONTAINER,
     experiment: str = MLFLOW_EXPERIMENT,
     checkpoints_dir: Path | None = None,
@@ -98,7 +107,12 @@ def resolve_base_checkpoint(
 
     from ..infra.checkpoint_store import CheckpointStore
 
-    target_run_id = run_id or _discover_active_base_run(azure_container, experiment=experiment)
+    target_run_id = run_id or _discover_active_base_run(
+        azure_container,
+        experiment=experiment,
+        preferred_stages=preferred_stages,
+        preferred_arith_format=preferred_arith_format,
+    )
     store = CheckpointStore(azure_container, target_run_id, experiment=experiment)
     versions = store._versions()
     if not versions:
@@ -125,6 +139,7 @@ def resolve_base_checkpoint(
         print(f"Using cached base checkpoint: {cached_path}", flush=True)
 
     ckpt = load_checkpoint(cached_path)
+    ckpt["resolved_run_id"] = target_run_id
     ckpt.setdefault("parent_run_id", target_run_id)
     ckpt.setdefault("model_config_dict", asdict(build_model_config(ckpt)))
     return cached_path, ckpt

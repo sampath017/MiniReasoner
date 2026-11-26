@@ -1,5 +1,6 @@
 """Leakage-free arithmetic dataset generation, inspection, disk/Drive persistence, and SFT masking."""
 
+import ast
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -1463,3 +1464,201 @@ def select_stratified_eval_problems(
             break
         idx += 1
     return selected
+
+
+def safe_eval_arithmetic_expr(expr: str) -> tuple[int, bool]:
+    """Safely evaluate integer arithmetic (`+`, `-`, `*`, exact `/`) via AST, flagging operator presence."""
+    cleaned = expr.strip()
+    if not cleaned or len(cleaned) > 256:
+        raise ValueError("Empty or oversized arithmetic expression.")
+    tree = ast.parse(cleaned, mode="eval")
+
+    def _eval_node(node: ast.AST) -> tuple[int, bool]:
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        if isinstance(node, ast.Constant):
+            if type(node.value) is not int:
+                raise ValueError("Only integer literals are permitted.")
+            return int(node.value), False
+        if isinstance(node, ast.UnaryOp):
+            val, has_op = _eval_node(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return val, has_op
+            if isinstance(node.op, ast.USub):
+                return -val, has_op
+            raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+        if isinstance(node, ast.BinOp):
+            lval, _ = _eval_node(node.left)
+            rval, _ = _eval_node(node.right)
+            if isinstance(node.op, ast.Add):
+                return lval + rval, True
+            if isinstance(node.op, ast.Sub):
+                return lval - rval, True
+            if isinstance(node.op, ast.Mult):
+                return lval * rval, True
+            if isinstance(node.op, ast.Div):
+                if rval == 0 or lval % rval != 0:
+                    raise ValueError("Exact integer division required.")
+                sign = -1 if (lval < 0) ^ (rval < 0) else 1
+                return sign * (abs(lval) // abs(rval)), True
+            raise ValueError(f"Unsupported binary operator: {type(node.op).__name__}")
+        raise ValueError(f"Unsupported syntax in trace expression: {type(node).__name__}")
+
+    return _eval_node(tree)
+
+
+def verify_work_trace(work_body: str) -> tuple[bool, int | None]:
+    """Verify every `;`-separated `Work:` equation holds (`LHS == RHS`, no no-op tautologies) and return final RHS."""
+    raw_clauses = [part.strip() for part in work_body.split(";")]
+    if not raw_clauses or any(not clause for clause in raw_clauses):
+        return False, None
+
+    last_val: int | None = None
+    for clause in raw_clauses:
+        if "=" not in clause:
+            return False, None
+        lhs, rhs = clause.split("=", 1)
+        rhs_match = _STRICT_INT_RE.fullmatch(rhs.strip())
+        if rhs_match is None:
+            return False, None
+        rhs_val = int(rhs_match.group(0))
+        lhs_clean = lhs.strip()
+
+        if lhs_clean == "neg":
+            if last_val is None or rhs_val != -last_val:
+                return False, None
+        else:
+            try:
+                lhs_val, has_binop = safe_eval_arithmetic_expr(lhs_clean)
+            except (SyntaxError, ValueError, RecursionError):
+                return False, None
+            if not has_binop or lhs_val != rhs_val:
+                return False, None
+        last_val = rhs_val
+
+    return True, last_val
+
+
+def score_strict_scratchpad_rollout(
+    raw_output: str,
+    expected_answer: int,
+    *,
+    ended_with_eos: bool = True,
+) -> dict:
+    """Strictly binary `{0.0, 1.0}` GRPO verifier: EOS + strict format + valid `Work:` trace + trace ends at exact `Answer:`."""
+    cleaned = raw_output.strip()
+    match = _SCRATCHPAD_RE.fullmatch(cleaned)
+    valid_format = match is not None and bool(match.group(1).strip())
+    extracted = int(match.group(2)) if valid_format else None
+
+    valid_work = False
+    last_work_val: int | None = None
+    if valid_format:
+        valid_work, last_work_val = verify_work_trace(match.group(1).strip())
+
+    trace_ends_at_answer = valid_format and valid_work and (last_work_val == extracted)
+    answer_match = valid_format and (extracted == expected_answer)
+    strict_pass = bool(ended_with_eos) and valid_format and valid_work and trace_ends_at_answer and answer_match
+
+    return {
+        "ended_with_eos": bool(ended_with_eos),
+        "valid_format": valid_format,
+        "valid_work": valid_work,
+        "trace_ends_at_answer": trace_ends_at_answer,
+        "last_work_val": last_work_val,
+        "extracted": extracted,
+        "exact_match": answer_match,
+        "strict_pass": strict_pass,
+        "reward": 1.0 if strict_pass else 0.0,
+    }
+
+
+_EASY_RL_CATEGORIES = frozenset({
+    "add_1d_no_carry",
+    "add_1d_carry",
+    "add_2d_no_carry",
+    "add_2d_carry",
+    "add_3d_no_carry",
+    "add_3d_carry",
+    "add_equal",
+    "add_zero",
+    "add_signed",
+    "sub_1d_no_borrow",
+    "sub_equal",
+    "sub_zero",
+    "mul_1d",
+    "mul_unit",
+    "mul_zero",
+    "div_1d",
+    "div_by_unit",
+    "div_zero",
+})
+
+
+def select_hard_rl_candidates(
+    train_examples: list[ArithmeticExample],
+    *,
+    exclude_easy_categories: bool = True,
+    canonical_only_first: bool = True,
+) -> tuple[list[ArithmeticExample], dict[str, list[ArithmeticExample]]]:
+    """Filter `train` examples to non-trivial candidates and index all wording variants by `canonical_id`."""
+    by_canonical: dict[str, list[ArithmeticExample]] = {}
+    pool: list[ArithmeticExample] = []
+    for ex in train_examples:
+        if exclude_easy_categories and ex.category in _EASY_RL_CATEGORIES:
+            continue
+        by_canonical.setdefault(ex.canonical_id, []).append(ex)
+
+    for cid in sorted(by_canonical):
+        items = by_canonical[cid]
+        if canonical_only_first:
+            primary = next((it for it in items if it.variant == "canonical"), items[0])
+            pool.append(primary)
+        else:
+            pool.extend(items)
+    return pool, by_canonical
+
+
+def save_rl_hard_dataset(directory: Path, examples: list[ArithmeticExample], manifest: dict) -> Path:
+    """Persist SHA-256 verified hard RL training examples and manifest cleanly to disk."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    fpath = directory / "hard_train.jsonl"
+    op_counts: dict[str, int] = {}
+    cat_counts: dict[str, int] = {}
+    with fpath.open("w", encoding="utf-8", newline="\n") as stream:
+        for ex in examples:
+            op_counts[ex.op] = op_counts.get(ex.op, 0) + 1
+            cat_counts[ex.category] = cat_counts.get(ex.category, 0) + 1
+            stream.write(json.dumps(asdict(ex), ensure_ascii=False) + "\n")
+
+    full_manifest = {
+        **manifest,
+        "count": len(examples),
+        "op_counts": dict(sorted(op_counts.items())),
+        "category_counts": dict(sorted(cat_counts.items())),
+        "files": {"hard_train.jsonl": {"count": len(examples), "sha256": sha256(fpath)}},
+    }
+    (directory / "manifest.json").write_text(json.dumps(full_manifest, indent=2) + "\n", encoding="utf-8")
+    return directory
+
+
+def load_rl_hard_dataset(directory: Path) -> tuple[list[ArithmeticExample], dict]:
+    """Load and SHA-256 verify a previously mined hard RL training dataset."""
+    directory = Path(directory)
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Hard RL manifest not found in {directory}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fpath = directory / "hard_train.jsonl"
+    if not fpath.is_file():
+        raise FileNotFoundError(f"Missing hard RL split {fpath}")
+    expected_sha = manifest.get("files", {}).get("hard_train.jsonl", {}).get("sha256")
+    if expected_sha and sha256(fpath) != expected_sha:
+        raise ValueError(f"Checksum mismatch for {fpath}")
+    items: list[ArithmeticExample] = []
+    with fpath.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip():
+                items.append(ArithmeticExample(**json.loads(line)))
+    return items, manifest

@@ -98,9 +98,10 @@ Use the compartmentalized evaluation notebooks under `notebooks/` (backed by sha
 - [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) — Phase 3 Base Model Evaluation (`32.05M` RoPE architecture & convergence curves, `SimpleStories` test PPL/BPB, Story Cloze `story_mc_acc`, RoPE position scaling, pre-SFT arithmetic baseline, throughput)
 - [phase4a_sft_direct.ipynb](notebooks/phase4a_sft_direct.ipynb) — Phase 4a Direct SFT (`arith_v2`, `Answer: <int>`)
 - [phase4b_sft_cot.ipynb](notebooks/phase4b_sft_cot.ipynb) — Phase 4b CoT Scratchpad + Multi-Step SFT (`arith_v3`, `Work: ... \nAnswer: <int>`)
-- [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) — Phase 4c CoT SFT with KV Cache (parity/speedup benchmark, full `6,002`-row `val` evaluation, fast local `ask_math` / `chat_math` playground)
+- [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) — Phase 4c CoT SFT with KV Cache (parity/speedup benchmark, full `6,002`-row `val` evaluation, fast local `ask_math` / `ask` playground)
+- [phase5_grpo_rl.ipynb](notebooks/phase5_grpo_rl.ipynb) — Phase 5 Verifiable-Reward GRPO RL (strict binary `{0, 1}` trace verifier, paired `RL vs CoT SFT` evaluation)
 
-Note: Phase 1 data preparation and Phase 2/4 training run via `bash scripts/prepare_data.sh` and `bash scripts/train.sh`; notebooks are strictly for evaluation and interactive testing.
+Note: Phase 1 data preparation, Phase 2/4 training, and Phase 5 GRPO mining/training run via `bash scripts/prepare_data.sh` and `bash scripts/train.sh`; notebooks are strictly for evaluation and interactive testing.
 
 See [COOKBOOK.md](COOKBOOK.md) for the complete end-to-end build, training, post-training SFT/RL, and release plan.
 

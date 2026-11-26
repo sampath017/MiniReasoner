@@ -293,35 +293,38 @@ def plot_run_history(
     val_pts = [(m["step"], m["val_loss"]) for m in metrics_history if m.get("val_loss") is not None]
     train_pts = [(m["step"], m["train_loss_interval_mean"]) for m in metrics_history if m.get("train_loss_interval_mean") is not None]
     story_pts = [(m["step"], m["story_val_loss"]) for m in metrics_history if m.get("story_val_loss") is not None]
+    strict_pts = [(m["step"], m["val_strict_pass"] * 100.0) for m in metrics_history if m.get("val_strict_pass") is not None]
     acc_pts = [(m["step"], m["val_exact_match"] * 100.0) for m in metrics_history if m.get("val_exact_match") is not None]
     fmt_pts = [(m["step"], m["val_valid_format"] * 100.0) for m in metrics_history if m.get("val_valid_format") is not None]
     lr_pts = [(m["step"], m["lr"]) for m in metrics_history if m.get("lr") is not None]
     tps_vals = [m["train_tokens_per_second"] for m in metrics_history if m.get("train_tokens_per_second") is not None]
     op_keys = sorted({k for m in metrics_history for k in m if k.startswith("val_acc_op_")})
-    is_sft = bool(acc_pts) or stage == "sft"
+    is_post_train = bool(acc_pts or strict_pts) or stage in ("sft", "rl")
 
     try:
         import matplotlib.pyplot as plt
 
-        n_cols = 3 if (is_sft or op_keys) else 2
+        n_cols = 3 if (is_post_train or op_keys) else 2
         fig, axes = plt.subplots(1, n_cols, figsize=(5.3 * n_cols, 4.3), dpi=100)
         ax1 = axes[0]
         if train_pts:
-            pts = [pt for pt in train_pts if not is_sft or pt[0] > 0] or train_pts
-            lbl = "Train Interval Mean (90% arith + 10% story)" if story_pts else "Train Loss (Interval Mean)"
+            pts = [pt for pt in train_pts if not is_post_train or pt[0] > 0] or train_pts
+            lbl = "Train Error Rate (1 - reward)" if stage == "rl" else (
+                "Train Interval Mean (90% arith + 10% story)" if story_pts else "Train Loss (Interval Mean)"
+            )
             ax1.plot([s for s, _ in pts], [v for _, v in pts], label=lbl, color="#2563eb", linewidth=2)
         if val_pts:
-            pts = [pt for pt in val_pts if not is_sft or pt[0] > 0] or val_pts
-            lbl = "Val Arith Loss" if is_sft else "Validation Loss"
+            pts = [pt for pt in val_pts if not is_post_train or pt[0] > 0] or val_pts
+            lbl = "Val Error Rate (1 - strict)" if stage == "rl" else ("Val Arith Loss" if is_post_train else "Validation Loss")
             ax1.plot([s for s, _ in pts], [v for _, v in pts], label=lbl, color="#dc2626", linewidth=2, linestyle="--")
         if story_pts:
             ax1.plot([s for s, _ in story_pts], [v for _, v in story_pts], label="Story Val Loss", color="#9333ea", linewidth=1.8, linestyle=":")
         max_step = max((m["step"] for m in metrics_history), default=0)
         ax1.set_title(f"Loss Convergence (0 to {max_step:,})", fontsize=11, fontweight="bold")
         ax1.set_xlabel("Step")
-        ax1.set_ylabel("Cross-Entropy Loss")
+        ax1.set_ylabel("Error / Loss" if stage == "rl" else "Cross-Entropy Loss")
         later = [v for _, v in val_pts[1:]]
-        if is_sft:
+        if is_post_train:
             top = max([v for _, v in story_pts] + later, default=2.0) + 0.15
             ax1.set_ylim(bottom=0.0, top=min(3.0, top))
         else:
@@ -329,9 +332,12 @@ def plot_run_history(
         ax1.grid(True, linestyle=":", alpha=0.6)
         ax1.legend(fontsize=8)
 
-        if acc_pts:
+        if acc_pts or strict_pts:
             ax2 = axes[1]
-            ax2.plot([s for s, _ in acc_pts], [v for _, v in acc_pts], label="Exact Match %", color="#0d9488", linewidth=2.2, marker="o", markersize=3.5)
+            if strict_pts:
+                ax2.plot([s for s, _ in strict_pts], [v for _, v in strict_pts], label="Strict Trace Pass %", color="#059669", linewidth=2.2, marker="s", markersize=3.5)
+            if acc_pts:
+                ax2.plot([s for s, _ in acc_pts], [v for _, v in acc_pts], label="Exact Match %", color="#0d9488", linewidth=2.0, marker="o", markersize=3.5)
             if fmt_pts:
                 ax2.plot([s for s, _ in fmt_pts], [v for _, v in fmt_pts], label="Valid Format %", color="#7c3aed", linewidth=1.6, linestyle="--")
             ax2.set_title("Held-Out Val Accuracy & Format", fontsize=11, fontweight="bold")

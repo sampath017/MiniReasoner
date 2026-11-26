@@ -76,6 +76,11 @@ class TokenStream:
         ids = torch.from_numpy(self.tokens[indices].astype(np.int64)).to(device)
         return ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
 
+    def close(self) -> None:
+        mmap = getattr(self.tokens, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
+
 
 class EpochBatchSampler:
     def __init__(self, data: TokenStream, batch_size: int, seed: int):

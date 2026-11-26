@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from src.infra import azure_blob, checkpoint_store, tracking
-from src.main import build_cleanup_parser, build_prepare_data_parser, build_sft_parser, build_train_parser
+from src.main import build_cleanup_parser, build_grpo_parser, build_prepare_data_parser, build_sft_parser, build_train_parser
 from src.settings import PRESETS
 from src.training import pretrain
 
@@ -178,14 +178,22 @@ def test_cli_parsers():
     corpus_prep = build_prepare_data_parser().parse_args(["--stage", "corpus", "--tokenizer-device", "cpu"])
     assert corpus_prep.stage == "corpus" and corpus_prep.tokenizer_device == "cpu"
 
+    rl_prep = build_prepare_data_parser().parse_args(["--stage", "rl", "--scan-limit", "500", "--include-trivial", "--no-drive"])
+    assert rl_prep.stage == "rl" and rl_prep.scan_limit == 500 and rl_prep.include_trivial and rl_prep.no_drive
+
     sft_args = build_sft_parser().parse_args([
         "--preset", "sft_pilot", "--format", "cot", "--max-digits", "4", "--nonnegative-only", "--context-length", "2048", "--no-retention",
     ])
     assert sft_args.preset == "sft_pilot" and sft_args.format == "cot" and sft_args.max_digits == 4 and sft_args.context_length == 2048 and sft_args.no_retention
 
+    grpo_args = build_grpo_parser().parse_args([
+        "--preset", "grpo_pilot", "--group-size", "4", "--prompts-per-step", "8", "--kl-coef", "0.05", "--scan-limit", "250", "--no-drive",
+    ])
+    assert grpo_args.preset == "grpo_pilot" and grpo_args.group_size == 4 and grpo_args.kl_coef == 0.05 and grpo_args.scan_limit == 250
+
     cleanup_args = build_cleanup_parser().parse_args(["--delete", "--yes", "--include-missing"])
     assert cleanup_args.delete and cleanup_args.yes and cleanup_args.include_missing
-    print("  [PASSED] CLI train, prepare-data, sft & cleanup argument parsers")
+    print("  [PASSED] CLI train, prepare-data, sft, grpo & cleanup argument parsers")
 
 
 class _FakeRunHandle:

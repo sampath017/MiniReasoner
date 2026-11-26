@@ -4,6 +4,7 @@
 # Commands:
 #   bash scripts/train.sh [options...]           # Starts Phase 2 pre-training inside tmux session 'train'
 #   bash scripts/train.sh sft [sft options...]   # Starts Phase 4 Arithmetic SFT inside tmux session 'train'
+#   bash scripts/train.sh grpo [grpo options...] # Starts Phase 5 GRPO RL inside tmux session 'train'
 #   bash scripts/train.sh attach                 # Attaches to running tmux session
 #   bash scripts/train.sh status                 # Checks job status and GPU utilization
 #   bash scripts/train.sh logs                   # Streams newest live training log in logs/
@@ -15,9 +16,10 @@
 #   bash scripts/train.sh --preset small --stop-after 20
 #   bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
 #
-# Examples (Phase 4 Arithmetic SFT - prepare/inspect data first via scripts/prepare_data.sh):
+# Examples (Phase 4 SFT & Phase 5 GRPO RL - prepare/inspect data first via scripts/prepare_data.sh):
 #   bash scripts/prepare_data.sh
 #   bash scripts/prepare_data.sh --format cot --multistep
+#   bash scripts/prepare_data.sh --stage rl
 #   bash scripts/train.sh sft --preset sft_pilot
 #   bash scripts/train.sh sft --preset sft
 #   bash scripts/train.sh sft --preset sft_scratchpad
@@ -25,6 +27,9 @@
 #   bash scripts/train.sh sft --preset sft --base-run-id <BASE_RUN_ID> --checkpoint-alias latest
 #   bash scripts/train.sh sft --preset sft --max-digits 4
 #   bash scripts/train.sh sft --preset sft --resume --run-id <SFT_RUN_ID>
+#   bash scripts/train.sh grpo --preset grpo_pilot
+#   bash scripts/train.sh grpo --preset grpo --sft-run-id <SFT_RUN_ID>
+#   bash scripts/train.sh grpo --preset grpo --resume --run-id <RL_RUN_ID>
 #
 # Monitoring & Control:
 #   bash scripts/train.sh status
@@ -59,11 +64,12 @@ python_command() {
 
 cmd_help() {
     cat <<'EOF'
-Usage: bash scripts/train.sh {start|sft|attach|status|logs|stop|restart|help} [options...]
+Usage: bash scripts/train.sh {start|sft|grpo|rl|attach|status|logs|stop|restart|help} [options...]
 
 Commands:
   [start] [options...]       Start Phase 2 pre-training in tmux session 'train' (attaches if interactive)
   sft [sft options...]       Start Phase 4 Arithmetic SFT in tmux session 'train'
+  grpo [grpo options...]     Start Phase 5 GRPO RL on failed hard CoT traces in tmux session 'train'
   attach                     Attach to the running tmux session 'train'
   status                     Show tmux status, GPU utilization, and recent logs
   logs                       Follow newest run log in logs/ without attaching to tmux
@@ -76,11 +82,14 @@ Examples:
   bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
   bash scripts/prepare_data.sh
   bash scripts/prepare_data.sh --format cot --multistep
+  bash scripts/prepare_data.sh --stage rl
   bash scripts/train.sh sft --preset sft_pilot
   bash scripts/train.sh sft --preset sft
   bash scripts/train.sh sft --preset sft_scratchpad
   bash scripts/train.sh sft --preset sft --context-length 2048
   bash scripts/train.sh sft --preset sft --resume --run-id <SFT_RUN_ID>
+  bash scripts/train.sh grpo --preset grpo_pilot
+  bash scripts/train.sh grpo --preset grpo
 EOF
     echo ""
     local py_cmd
@@ -91,6 +100,8 @@ EOF
     eval "$py_cmd src/main.py prepare-data --help"
     echo ""
     eval "$py_cmd src/main.py sft --help"
+    echo ""
+    eval "$py_cmd src/main.py grpo --help"
 }
 
 cmd_start() {

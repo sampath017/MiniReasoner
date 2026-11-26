@@ -19,10 +19,11 @@ from ..data.arithmetic import (
     prepare_arithmetic_dataset,
     render_examples,
     score_arithmetic_completion,
+    score_strict_scratchpad_rollout,
     select_stratified_eval_problems,
 )
 from ..training.common import loss_for
-from .generate import generate_batch_greedy, generate_text
+from .generate import generate_batch_greedy, generate_batch_greedy_with_meta, generate_text
 from .tokenizer import EOS
 
 
@@ -329,8 +330,9 @@ def evaluate_arithmetic_split(
     max_misses_to_show: int = 15,
     base_model: torch.nn.Module | None = None,
     base_tokenizer: Tokenizer | None = None,
+    strict_trace: bool = False,
 ) -> dict:
-    """Benchmark SFT checkpoint on `val` (or `test` in Phase 6) with masked loss and exact-match breakdown."""
+    """Benchmark SFT/RL checkpoint on `val` (or `test` in Phase 6) with masked loss and exact-match/strict-trace breakdown."""
     if eval_split == "test" and not allow_sealed_test:
         raise RuntimeError("Sealed `test` split is locked for Phase 6. Set allow_sealed_test=True only for release verification.")
 
@@ -388,38 +390,56 @@ def evaluate_arithmetic_split(
             next_report += max(200, total // 10)
 
     if use_kv_cache:
-        completions = generate_batch_greedy(
+        meta_rows = generate_batch_greedy_with_meta(
             model, tokenizer, prompts, max_new_tokens=max_new_tokens,
             device=device, batch_size=batch_size, progress_callback=_report,
         )
+        completions = [r["text"] for r in meta_rows]
+        eos_flags = [r["ended_with_eos"] for r in meta_rows]
     else:
         completions = []
+        eos_flags = []
         for idx, p in enumerate(prompts, start=1):
-            completions.append(generate_text(model, tokenizer, p, max_new_tokens=max_new_tokens, device=device, temperature=0.0, use_cache=False))
+            text = generate_text(model, tokenizer, p, max_new_tokens=max_new_tokens, device=device, temperature=0.0, use_cache=False)
+            completions.append(text)
+            tok_cnt = len(tokenizer.encode(text, add_special_tokens=False).ids) if text else 0
+            eos_flags.append(tok_cnt < max_new_tokens)
             _report(idx, len(prompts))
     gen_elapsed = time.perf_counter() - gen_start
 
     exact_hits = 0
+    strict_hits = 0
     valid_hits = 0
+    work_hits = 0
+    eos_hits = 0
     op_stats: dict[str, list[int]] = {}
     cat_stats: dict[str, list[int]] = {}
     scored_rows: list[dict] = []
     passes: list[tuple[ArithmeticExample, str, dict]] = []
     misses: list[tuple[ArithmeticExample, str, dict]] = []
 
-    for ex, raw in zip(examples, completions):
-        verdict = score_arithmetic_completion(raw, ex.answer, answer_format=am_format)
+    use_strict = bool(strict_trace and am_format == "scratchpad")
+    for ex, raw, ended_eos in zip(examples, completions, eos_flags):
+        if use_strict:
+            verdict = score_strict_scratchpad_rollout(raw, ex.answer, ended_with_eos=ended_eos)
+            passed = bool(verdict["strict_pass"])
+            work_hits += int(verdict["valid_work"])
+            eos_hits += int(verdict["ended_with_eos"])
+        else:
+            verdict = score_arithmetic_completion(raw, ex.answer, answer_format=am_format)
+            passed = bool(verdict["exact_match"])
         exact_hits += int(verdict["exact_match"])
+        strict_hits += int(passed)
         valid_hits += int(verdict["valid_format"])
         op_e = op_stats.setdefault(ex.op, [0, 0])
         op_e[1] += 1
-        op_e[0] += int(verdict["exact_match"])
+        op_e[0] += int(passed)
         cat_e = cat_stats.setdefault(ex.category, [0, 0])
         cat_e[1] += 1
-        cat_e[0] += int(verdict["exact_match"])
+        cat_e[0] += int(passed)
         row = {"op": ex.op, "category": ex.category, "prompt": ex.prompt, "expected": ex.answer, "completion": raw, **verdict}
         scored_rows.append(row)
-        if verdict["exact_match"]:
+        if passed:
             passes.append((ex, raw, verdict))
         else:
             misses.append((ex, raw, verdict))
@@ -428,8 +448,12 @@ def evaluate_arithmetic_split(
     print("\n" + "=" * 88)
     print(f"OVERALL {eval_split.upper()} RESULTS ({len(examples):,} problems in {gen_elapsed:.1f}s | {len(examples) / max(1e-6, gen_elapsed):.1f} ex/s)")
     print("=" * 88)
+    if use_strict:
+        print(f"Strict Trace Pass:    {strict_hits:,}/{len(examples):,} ({strict_hits / n_total * 100:.2f}%)")
     print(f"Exact Match Accuracy: {exact_hits:,}/{len(examples):,} ({exact_hits / n_total * 100:.2f}%)")
     print(f"Valid Format Rate:    {valid_hits:,}/{len(examples):,} ({valid_hits / n_total * 100:.2f}%)")
+    if use_strict:
+        print(f"Valid Work Trace:     {work_hits:,}/{len(examples):,} ({work_hits / n_total * 100:.2f}%) | EOS rate: {eos_hits / n_total * 100:.2f}%")
     print(f"Masked Arith Loss:    {eval_loss:.4f}")
 
     print("\nPer-Operation Breakdown:")
@@ -460,26 +484,39 @@ def evaluate_arithmetic_split(
             print(f"    Gold ({ex.answer})")
 
     if base_model is not None and base_tokenizer is not None and examples:
-        cmp_n = min(24, len(examples))
-        base_ok = sum(
-            int(
-                score_arithmetic_completion(
-                    generate_text(base_model, base_tokenizer, ex.prompt, max_new_tokens=max_new_tokens, device=device, temperature=0.0, use_cache=use_kv_cache),
-                    ex.answer,
-                    answer_format=am_format,
-                )["exact_match"]
-            )
-            for ex in examples[:cmp_n]
+        cmp_n = min(24 if not use_strict else len(examples), len(examples))
+        base_meta = generate_batch_greedy_with_meta(
+            base_model, base_tokenizer, [ex.prompt for ex in examples[:cmp_n]], max_new_tokens=max_new_tokens, device=device, batch_size=batch_size,
         )
-        sft_ok = sum(int(r["exact_match"]) for r in scored_rows[:cmp_n])
+        base_flags = [
+            bool(
+                score_strict_scratchpad_rollout(bm["text"], ex.answer, ended_with_eos=bm["ended_with_eos"])["strict_pass"]
+                if use_strict
+                else score_arithmetic_completion(bm["text"], ex.answer, answer_format=am_format)["exact_match"]
+            )
+            for ex, bm in zip(examples[:cmp_n], base_meta)
+        ]
+        cur_flags = [
+            bool(r.get("strict_pass") if use_strict else r["exact_match"])
+            for r in scored_rows[:cmp_n]
+        ]
+        base_ok = sum(int(b) for b in base_flags)
+        cur_ok = sum(int(c) for c in cur_flags)
+        fixed = sum(1 for b, c in zip(base_flags, cur_flags) if not b and c)
+        broke = sum(1 for b, c in zip(base_flags, cur_flags) if b and not c)
         print("\n" + "-" * 88)
-        print(f"Paired Subset ({cmp_n} items): Base={base_ok}/{cmp_n} ({base_ok / cmp_n * 100:.1f}%) -> SFT={sft_ok}/{cmp_n} ({sft_ok / cmp_n * 100:.1f}%)")
+        print(
+            f"Paired Comparison ({cmp_n:,} items): Parent={base_ok}/{cmp_n} ({base_ok / cmp_n * 100:.1f}%) -> "
+            f"Current={cur_ok}/{cmp_n} ({cur_ok / cmp_n * 100:.1f}%) | fixed={fixed}, broke={broke} (net={fixed - broke:+d})"
+        )
     print("=" * 88)
 
     return {
         "eval_loss": eval_loss,
+        "strict_pass": strict_hits / n_total,
         "exact_match": exact_hits / n_total,
         "valid_format": valid_hits / n_total,
+        "valid_work": work_hits / n_total if use_strict else exact_hits / n_total,
         "op_stats": op_stats,
         "cat_stats": cat_stats,
         "rows": scored_rows,

@@ -176,15 +176,21 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 
 ---
 
-## Phase 5 · Verifiable-Reward RL (GRPO)
+## Phase 5 · Verifiable-Reward RL (GRPO) (`src/training/grpo.py`)
 
-- Initialize policy and frozen reference model from the selected Phase 4 SFT checkpoint ([GRPO paper](https://arxiv.org/abs/2402.03300)).
-- Generate $G$ rollouts (e.g., $G = 4$) per training prompt.
-- **Deterministic Verifier (`{0, 1}` reward):**
-  - Award **`1.0`** only if the completion contains **strictly one valid integer** matching the ground-truth answer, cleanly terminated by `<|eos|>` (or agreed stop) with no extra guesses, conflicting numbers, or story drift.
-  - Award **`0.0`** otherwise (explicitly test the verifier on `0`, negative signs if enabled, multiple numbers, whitespace, and empty outputs).
-- Focus RL prompts on categories where SFT produces mixed groups (both right and wrong rollouts provide gradient variance). Keep KL regularization against the frozen SFT reference and monitor mean answer length, invalid-format rate, held-out greedy arithmetic accuracy, and story retention.
-- **Promotion Gate:** Run paired greedy evaluation (`RL` vs. `SFT` on identical val problems), counting wins (`RL fixed`) vs. regressions (`RL broke`) by category. Promote RL only if gains clearly exceed paired noise without degrading story quality beyond tolerance.
+- Initialize policy and frozen reference model from the selected Phase 4 CoT SFT checkpoint (`e57bf52b...` Step `10,000`, [GRPO paper](https://arxiv.org/abs/2402.03300)).
+- **Filtered Hard Training Dataset (`hard_train.jsonl`, strictly from `train`):** Mine canonical non-trivial `train` problems (plus wording variants of failed canonicals) where the CoT SFT checkpoint fails the strict verifier (`reward == 0.0`), leaving `val` and `sealed_test` untouched:
+  ```bash
+  bash scripts/prepare_data.sh --stage rl
+  bash scripts/train.sh grpo --preset grpo_pilot   # Quick pilot check
+  bash scripts/train.sh grpo --preset grpo         # Full 300-step GRPO run (G=8, 16 prompts/step)
+  ```
+- **Strictly Binary `{0.0, 1.0}` Trace Verifier (`score_strict_scratchpad_rollout` in [src/data/arithmetic.py](src/data/arithmetic.py)) — zero partial rewards:**
+  1. Strict regex (`^Work:\s*([^\r\n]+)\r?\nAnswer:\s*(-?\d+)$`) **and** clean `<|eos|>` stop.
+  2. Every `;`-separated `Work:` clause holds (`LHS == RHS` via safe AST evaluator, exact `/` divisibility, `neg=` on previous step), rejecting no-op tautologies (`91155=91155`).
+  3. Final `Work:` step equals `Answer:`.
+  4. `Answer:` equals ground truth.
+- Keep Schulman non-negative KL regularization against the frozen SFT reference (`kl_coef = 0.04`), track `mean_reward`, `frac_mixed_groups`, `mean_completion_tokens`, `val_strict_pass`, `story_val_loss`, and inspect paired `RL fixed` vs. `RL broke` wins/regressions in [phase5_grpo_rl.ipynb](notebooks/phase5_grpo_rl.ipynb).
 
 ---
 

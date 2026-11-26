@@ -16,7 +16,8 @@ load_dotenv(project_root / ".env")
 from src.data.arithmetic import ANSWER_FORMAT_CHOICES, SUPPORTED_OPS, prepare_arithmetic_dataset
 from src.data.corpus import ensure_tokenized_corpus
 from src.infra.tracking import sync_deleted_runs
-from src.settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT, PRESETS, SFT_DATA_DEFAULTS, SFT_PRESETS
+from src.settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT, PRESETS, RL_PRESETS, SFT_DATA_DEFAULTS, SFT_PRESETS
+from src.training.grpo import prepare_hard_rl_dataset, run_grpo
 from src.training.pretrain import run_training
 from src.training.sft import run_sft
 
@@ -24,12 +25,13 @@ from src.training.sft import run_sft
 def build_train_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.main [train]",
-        description="MiniReasoner CLI - Pre-train, prepare SFT data, run SFT, or sync Azure checkpoints.",
+        description="MiniReasoner CLI - Pre-train, prepare data, run SFT/GRPO RL, or sync Azure checkpoints.",
         epilog=(
             "Subcommands:\n"
             "  train                Pretrain a MiniReasoner base model (default command)\n"
-            "  prepare-data         Generate, preview, save, and cache Phase 1 corpus or Phase 4 SFT data\n"
+            "  prepare-data         Generate, preview, save, and cache Phase 1 corpus, Phase 4 SFT, or Phase 5 failed RL data\n"
             "  sft                  Phase 4 Arithmetic Supervised Fine-Tuning from a prepared dataset\n"
+            "  grpo (rl)            Phase 5 Verifiable-Reward GRPO RL on failed hard CoT traces\n"
             "  cleanup (sync-azure) Preview or delete Azure checkpoints for MLflow runs deleted in Databricks\n\n"
             "Run `python src/main.py <subcommand> --help` for options."
         ),
@@ -87,13 +89,13 @@ def build_train_parser() -> argparse.ArgumentParser:
 def build_prepare_data_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.main prepare-data",
-        description="Generate, inspect, save to disk, and cache Phase 1 SimpleStories corpus or Phase 4 arithmetic SFT splits (`direct` vs `cot`).",
+        description="Generate, inspect, save to disk, and cache Phase 1 corpus, Phase 4 SFT splits (`direct` vs `cot`), or Phase 5 failed RL prompts.",
     )
     parser.add_argument(
         "--stage",
         default="sft",
-        choices=["sft", "corpus"],
-        help="Dataset stage to prepare: 'sft' arithmetic splits (default) or 'corpus' SimpleStories tokens.",
+        choices=["sft", "corpus", "rl"],
+        help="Dataset stage to prepare: 'sft' arithmetic splits (default), 'corpus' SimpleStories tokens, or 'rl' mined failed prompts.",
     )
     parser.add_argument(
         "--ops",
@@ -160,6 +162,13 @@ def build_prepare_data_parser() -> argparse.ArgumentParser:
         choices=["auto", "cpu", "cuda"],
         help="Device for training BPE tokenizer when --stage corpus runs from scratch (default: auto).",
     )
+    parser.add_argument("--sft-run-id", default=None, help="Source CoT SFT run ID for --stage rl mining.")
+    parser.add_argument("--checkpoint-alias", default=None, help="SFT checkpoint alias (`latest`, `best`, `step-N`) for --stage rl.")
+    parser.add_argument("--sft-checkpoint", type=Path, default=None, help="Optional local CoT SFT .pt checkpoint for --stage rl.")
+    parser.add_argument("--scan-limit", type=int, default=None, help="Optional cap on canonical train problems scanned when --stage rl mines failures.")
+    parser.add_argument("--scan-batch-size", type=int, default=None, help="Batch size for --stage rl greedy failure scan.")
+    parser.add_argument("--include-trivial", action="store_true", help="Include 100%%-solved trivial categories (`add`, `*_zero`, `*_unit`, `*_1d`) during --stage rl mining.")
+    parser.add_argument("--no-expand-variants", action="store_true", help="Keep only canonical failed train prompts instead of scanning failed wording variants.")
     parser.add_argument(
         "--no-drive",
         action="store_true",
@@ -272,6 +281,55 @@ def build_sft_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_grpo_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.main grpo",
+        description="Run Phase 5 Group Relative Policy Optimization (GRPO) on failed hard arithmetic traces.",
+    )
+    parser.add_argument(
+        "--preset",
+        default="grpo",
+        choices=list(RL_PRESETS.keys()),
+        help="GRPO hyperparameter preset (default: grpo; use grpo_pilot for fast smoke runs).",
+    )
+    parser.add_argument("--sft-run-id", default=None, help="Azure/MLflow run ID of the Phase 4 CoT SFT checkpoint (default: newest active scratchpad SFT run).")
+    parser.add_argument("--checkpoint-alias", default=None, help="Source SFT checkpoint alias: latest, best, or step-N (default: latest).")
+    parser.add_argument("--sft-checkpoint", type=Path, default=None, help="Optional local CoT SFT .pt file for offline initialization.")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Path to source CoT arithmetic SFT directory (arith_v3).")
+    parser.add_argument("--rl-data-dir", type=Path, default=None, help="Optional directory to read/write mined hard failed RL examples.")
+    parser.add_argument("--ops", nargs="+", default=None, help="Source operations selector (default: add sub mul div).")
+    parser.add_argument("--max-digits", type=int, default=None, help="Maximum operand digits (default: 3).")
+    parser.add_argument("--nonnegative-only", action="store_true", default=None, help="Match nonnegative-only arithmetic dataset.")
+    parser.add_argument("--samples-per-op", type=int, default=None, help="Source canonical problems per op (default: 12000).")
+    parser.add_argument("--scan-limit", type=int, default=None, help="Optional cap on canonical train items scanned if mining hard failures on the fly.")
+    parser.add_argument("--overwrite-hard-data", action="store_true", help="Re-mine failed hard RL examples instead of reusing cached hard_train.jsonl.")
+    parser.add_argument("--no-drive", action="store_true", help="Disable Google Drive restore fallback for dataset loading.")
+    parser.add_argument("--context-length", type=int, default=None, help="Optional context length override.")
+    parser.add_argument("--steps", type=int, default=None, help="Override total GRPO optimizer steps.")
+    parser.add_argument("--prompts-per-step", type=int, default=None, help="Number of hard failed prompts sampled per GRPO step.")
+    parser.add_argument("--group-size", type=int, default=None, help="Number of rollouts G sampled per prompt (must be >= 2).")
+    parser.add_argument("--mini-batch-size", type=int, default=None, help="Chunk size for log-prob/backward accumulation.")
+    parser.add_argument("--ppo-epochs", type=int, default=None, help="Gradient passes per sampled rollout batch (default: 1).")
+    parser.add_argument("--kl-coef", type=float, default=None, help="Frozen CoT SFT reference KL penalty coefficient beta.")
+    parser.add_argument("--clip-eps", type=float, default=None, help="PPO/GRPO probability ratio clipping epsilon.")
+    parser.add_argument("--temperature", type=float, default=None, help="Rollout sampling temperature.")
+    parser.add_argument("--lr", type=float, default=None, help="Override GRPO peak learning rate.")
+    parser.add_argument("--eval-every", type=int, default=None, help="Override val evaluation / Azure checkpoint interval.")
+    parser.add_argument("--no-retention-eval", action="store_true", help="Skip SimpleStories validation loss monitoring during GRPO.")
+    parser.add_argument("--resume", action="store_true", help="Resume an existing GRPO run from Azure Blob Storage.")
+    parser.add_argument("--run-id", default=None, help="Databricks MLflow run ID to resume when --resume is set.")
+    parser.add_argument("--stop-after", type=int, default=None, help="Stop GRPO early at absolute step.")
+    parser.add_argument(
+        "--precision",
+        default="auto",
+        choices=["auto", "bf16", "fp32"],
+        help="Precision (default: auto -> BF16 on Ampere+, FP32 otherwise).",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Override GRPO random seed (default: 42).")
+    parser.add_argument("--loss-decimals", type=int, default=4, help="Decimal digits for printed metrics (default: 4).")
+    return parser
+
+
 def build_cleanup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.main cleanup",
@@ -327,6 +385,23 @@ def main(argv: list[str] | None = None) -> None:
                 tokenizer_device=args.tokenizer_device,
                 sync_drive=not args.no_drive,
             )
+        elif args.stage == "rl":
+            prepare_hard_rl_dataset(
+                sft_run_id=args.sft_run_id,
+                sft_checkpoint_alias=args.checkpoint_alias,
+                sft_checkpoint=args.sft_checkpoint,
+                rl_data_dir=args.output_dir,
+                ops=args.ops,
+                max_digits=args.max_digits,
+                allow_negative=not args.nonnegative_only,
+                samples_per_op=args.samples_per_op,
+                scan_limit=args.scan_limit,
+                scan_batch_size=args.scan_batch_size,
+                exclude_easy_categories=not args.include_trivial,
+                expand_failed_variants=not args.no_expand_variants,
+                no_drive=args.no_drive,
+                overwrite=args.overwrite,
+            )
         else:
             prepare_arithmetic_dataset(
                 output_dir=args.output_dir,
@@ -342,6 +417,44 @@ def main(argv: list[str] | None = None) -> None:
                 sync_drive=not args.no_drive,
                 overwrite=args.overwrite,
             )
+        return
+
+    if raw_argv and raw_argv[0] in ("grpo", "rl"):
+        args = build_grpo_parser().parse_args(raw_argv[1:])
+        allow_negative = False if args.nonnegative_only else None
+        run_grpo(
+            preset=args.preset,
+            sft_run_id=args.sft_run_id,
+            sft_checkpoint_alias=args.checkpoint_alias,
+            sft_checkpoint=args.sft_checkpoint,
+            data_dir=args.data_dir,
+            rl_data_dir=args.rl_data_dir,
+            ops=args.ops,
+            max_digits=args.max_digits,
+            allow_negative=allow_negative,
+            samples_per_op=args.samples_per_op,
+            scan_limit=args.scan_limit,
+            overwrite_hard_data=args.overwrite_hard_data,
+            no_drive=args.no_drive,
+            context_length=args.context_length,
+            steps=args.steps,
+            prompts_per_step=args.prompts_per_step,
+            group_size=args.group_size,
+            mini_batch_size=args.mini_batch_size,
+            ppo_epochs=args.ppo_epochs,
+            kl_coef=args.kl_coef,
+            clip_eps=args.clip_eps,
+            temperature=args.temperature,
+            learning_rate=args.lr,
+            eval_every=args.eval_every,
+            disable_retention_eval=args.no_retention_eval,
+            resume=args.resume,
+            mlflow_run_id=args.run_id,
+            stop_after=args.stop_after,
+            precision_request=args.precision,
+            seed=args.seed,
+            loss_decimals=args.loss_decimals,
+        )
         return
 
     if raw_argv and raw_argv[0] == "sft":
