@@ -97,8 +97,8 @@ bash scripts/train.sh --preset base --resume --run-id <MLFLOW_RUN_ID>
 
 ## Phase 3 · After Pre-Training (Evaluation, Baseline & Cleanup)
 
-### 3.1 Evaluate & Select the Base Checkpoint ([notebooks/evaluation.ipynb](notebooks/evaluation.ipynb))
-Run [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) locally (CPU FP32) or on GPU (CUDA BF16/FP32). It automatically:
+### 3.1 Evaluate & Select the Base Checkpoint ([notebooks/phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb))
+Run [notebooks/phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) locally (CPU FP32) or on GPU (CUDA BF16/FP32). It automatically:
 1. Discovers active runs in Azure container `minireasoner` (`RUN_ID = None` selects the newest active run) and caches the chosen checkpoint under `checkpoints/<run_id>/`.
 2. Inspects RoPE weights, parameter counts (`32,049,152`), and plots the convergence & learning rate curves.
 3. Scores the model on **held-out SimpleStories `test` split stories**:
@@ -127,37 +127,52 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 
 ## Phase 4 · Arithmetic Supervised Fine-Tuning (SFT)
 
-### 4.1 Problem Design, Generation & Inspection (`scripts/prepare_sft_data.sh`)
+### 4.1 Problem Design, Generation & Inspection (`scripts/prepare_data.sh`)
 - **Operations & Range:** Defaults to **all four operations** (`add`, `sub`, `mul`, `div` — exact integer division; optional `mod` remainder) over **signed integers up to 3 digits** (`-999..999`, covering negatives, zeros, carries, and borrows), scalable to `4+` digits (`--max-digits 4`).
 - Build answers using exact Python integer arithmetic.
 - **Deduplicated Splits:** Split by the underlying canonical problem **before** generating wording variants: keep `7 + 8`, `8 + 7`, and `"What is seven plus eight?"` (and `7 * 8` vs `8 * 7`) in the same split while preserving order for `sub`/`div`/`mod`. Maintain three disjoint splits: `train.jsonl`, `val.jsonl` (validation during SFT), and sealed `test.jsonl` (reserved strictly for final release testing).
-- Standardize prompt/target format, e.g. `What is 47 + 8?\nAnswer:` → `55<|eos|>` and `What is -144 / 12?\nAnswer:` → `-12<|eos|>`.
+- **Direct (`arith_v2`) vs. Numeric Scratchpad CoT (`arith_v3`):**
+  - **Direct (`--format direct`):** Prompt `What is 47 + 8?\nAnswer:` → `55<|eos|>` and `What is -144 / 12?\nAnswer:` → `-12<|eos|>`.
+  - **Numeric Scratchpad CoT + Multi-Step (`--format cot --multistep` / `--format scratchpad --multistep`):** Prompt `What is -831 * 986?\n` → `Work: 986*800=788800; 986*30=29580; 986*1=986; 788800+29580=818380; 818380+986=819366; neg=-819366\nAnswer: -819366<|eos|>`, plus chained expressions, conversational multi-step math wordings, and PEMDAS order-of-operations problems (`multi`).
 - **Generate, Inspect & Cache First (Separate from Training):**
   ```bash
-  # Generate default 3-digit signed all-4-op splits, print preview, save to data/sft/, and cache to Google Drive
-  bash scripts/prepare_sft_data.sh
+  # Normal direct SFT data (arith_v2)
+  bash scripts/prepare_data.sh
+
+  # SFT with Chain-of-Thought scratchpad + multi-step conversational math (arith_v3)
+  bash scripts/prepare_data.sh --format cot --multistep
+
+  # Phase 1 SimpleStories tokenized corpus & BPE tokenizer
+  bash scripts/prepare_data.sh --stage corpus
 
   # Custom options (e.g. 4 digits, include remainder 'mod', or skip Drive upload locally)
-  bash scripts/prepare_sft_data.sh --max-digits 4 --ops add sub mul div mod
-  bash scripts/prepare_sft_data.sh --no-drive
+  bash scripts/prepare_data.sh --max-digits 4 --ops add sub mul div mod
+  bash scripts/prepare_data.sh --no-drive
   ```
 
-### 4.2 SFT Training Protocol (`src/data/arithmetic.py`, `src/training/sft.py`)
+### 4.2 SFT Training & Evaluation Notebooks (`src/data/arithmetic.py`, `src/training/sft.py`)
 - Training reads the inspected dataset from `data/sft/` (or automatically restores & SHA-256 verifies it from Google Drive `gdrive:MiniReasoner/data/sft/`).
 - Initialize from the chosen Phase 3 base checkpoint (`--checkpoint-alias latest` by default, or `best`/`--base-checkpoint`), using a **fresh optimizer** and **new MLflow run** tagged with `stage="sft"`, `parent_run_id`, and `parent_checkpoint_step`.
 - **Optional Context Extension (`1,024 → 2,048`):** Keeps `1,024` by default; pass `--context-length 2048` whenever multi-step reasoning traces need extra context headroom.
-- Mask cross-entropy loss on the prompt tokens (`-100`) and compute loss **only on the answer + `<|eos|>`**.
+- Mask cross-entropy loss on the prompt tokens (`-100`) and compute loss **only on the answer (`Work:` + `Answer:` for CoT/scratchpad) + `<|eos|>`**.
 - Mix a SimpleStories retention slice (`--retention-ratio 0.1`, or `--no-retention` when running isolated dry/pilot tests) and evaluate during training **only on `val`** (`val_arith_loss`, per-operation & per-category greedy `val_exact_match`, and `story_val_loss`), keeping `test.jsonl` sealed until Phase 6.
-- Run a small pilot first, inspect per-category failure modes, expand demonstrations, and promote:
+- Run a small pilot first, inspect per-category failure modes, evaluate in dedicated phase notebooks ([phase4a_sft_direct.ipynb](notebooks/phase4a_sft_direct.ipynb), [phase4b_sft_cot.ipynb](notebooks/phase4b_sft_cot.ipynb), [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb)), and promote:
   ```bash
   # Run fast pilot in tmux
   bash scripts/train.sh sft --preset sft_pilot
 
-  # Full Phase 4 run (or extend context to 2048 tokens)
-  bash scripts/train.sh sft --preset sft
-  bash scripts/train.sh sft --preset sft --context-length 2048
+  # Direct SFT vs. Numeric Scratchpad + Multi-Step SFT (recommended)
+  bash scripts/train.sh sft --preset sft --steps 8000 --eval-every 500
+  bash scripts/train.sh sft --preset sft_scratchpad
   ```
-- **Promotion Gate:** Promote the best SFT checkpoint as the reference model for Phase 5. If SFT already achieves near-ceiling accuracy on 3-digit problems, escalate difficulty (`--max-digits 4` or short word problems) before spending GPU budget on RL.
+- **Promotion Gate:** Promote the best SFT checkpoint as the reference model for Phase 5. If SFT already achieves near-ceiling accuracy on 3-digit problems, target remaining mixed categories (e.g., `mul_3d`, multi-step conversational chains) or escalate difficulty (`--max-digits 4`) before spending GPU budget on RL.
+
+### 4.3 Recorded Phase 4 SFT Runs (`A30`, Base Parent `23a72f3a...` Step `26,047`)
+| Run ID | Preset / Format | Steps | Final Val Arith Loss | Val Exact Match | Story Val Loss | Highlights / Op Breakdown |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `e8996fa3b67f48c8951cfd20f68ab40b` | `sft` (`arith_v2`, direct) | 1,200 | `0.9972` | `29.2%` (`70/240`; peak `29.6%` at 1k) | `1.1571` | Undertrained (`~0.13` epochs); `100%` valid format |
+| `ef3cc27cede44edf90ff5f205a2f71d6` | `sft` (`arith_v2`, `--steps 8000`) | 8,000 | `0.2217` | `88.8%` (`213/240`; peak `89.6%` at 7k) | `1.2021` | `add=62/66`, `div=50/51`, `sub=64/70`, `mul=37/53` (`mul_3d=3/10` direct bottleneck) |
+| **`e57bf52bb95842dba6628092261584c4`** | **`sft_scratchpad` (`arith_v3`, scratchpad + multistep)** | **10,000** | **`0.0022`** | **`97.9%`** (`274/280`) | **`1.1796`** | **`add=66/66`, `sub=70/70`, `div=49/50`, `mul=47/49` (`mul_3d=7/9`), `multi=42/45`; `100.0%` valid format** |
 
 ---
 
@@ -179,7 +194,7 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 2. Run **once** on:
    - The **sealed arithmetic test set** (exact-match accuracy, valid-format rate, per-category breakdown, generalization to unseen wordings/lengths, failure inspection).
    - The **published `SimpleStories` test split** (`test_loss`, `test_ppl`, `test_bpb`, `story_mc_acc`, and 5 canonical story prompts) to confirm zero catastrophic forgetting.
-3. Verify offline CPU loading and deterministic greedy generation in [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) (`DEVICE_PREFERENCE = "cpu"`).
+3. Verify offline CPU loading and deterministic greedy generation in [notebooks/phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) & [notebooks/phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) (`configure_eval_device("cpu")`).
 4. Record final release artifact URIs (Azure blob name + SHA-256, Databricks run ID + parent lineage, Google Drive corpus manifest) before pruning experimental checkpoints or deleting the GPU VM.
 
 ---
@@ -188,7 +203,7 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 
 | Date / Milestone | Evidence Recorded | Decision |
 | --- | --- | --- |
-| 25 Nov 2026 | Run `23a72f3a...` (`1,024` ctx, `RoPE`) finished 1 full epoch (`26,047` steps): best val **`1.1302`** at Step `25,000`, final **`1.1303`** at Step `26,047` | Promote `RoPE` `1,024`-ctx base model (extensible up to `2,048` for SFT); evaluate Step `25,000` vs `26,047` in `evaluation.ipynb` |
-| Phase 3 (Next) | Held-out SimpleStories test PPL/BPB, 4-choice Story Cloze accuracy, RoPE position-bucket scaling (`1–1,024`), and pre-SFT arithmetic baseline | Lock base checkpoint, clean up deleted MLflow Azure blobs (`c26cf6e5...`), and record pre-SFT baseline |
-| Phase 4 (Planned) | Val arithmetic accuracy by category + story retention after SFT pilot | Expand SFT demonstrations, move to GRPO pilot, or escalate problem difficulty |
+| 25 Nov 2026 | Run `23a72f3a...` (`1,024` ctx, `RoPE`) finished 1 full epoch (`26,047` steps): best val **`1.1302`** at Step `25,000`, final **`1.1303`** at Step `26,047` | Promote `RoPE` `1,024`-ctx base model (extensible up to `2,048` for SFT); evaluate Step `25,000` vs `26,047` in `phase3_base_evaluation.ipynb` |
+| Phase 3 | Held-out SimpleStories test PPL/BPB, 4-choice Story Cloze accuracy, RoPE position-bucket scaling (`1–1,024`), and pre-SFT arithmetic baseline | Promoted `23a72f3a...` (`latest_step_26047_095810fa.pt`) into Phase 4 |
+| Phase 4 (26 Nov 2026) | Direct SFT (`ef3cc27c...`, 8k steps) hit `88.8%` (`89.6%` peak, `mul_3d=3/10`); Scratchpad + Multi-Step SFT (`e57bf52b...`, 10k steps) reached **`97.9%`** (`274/280`, `val_arith_loss=0.0022`, `story_val_loss=1.1796`) | Promote `e57bf52b...` (`sft_scratchpad` Step `10,000`) as Phase 5 GRPO RL reference checkpoint |
 | Phase 5–6 (Planned) | Paired GRPO vs. SFT val wins/regressions, sealed arithmetic test, final CPU load check | Select final release checkpoint and archive provenance |

@@ -91,4 +91,4 @@ mv -f -- "$hint_tmp" "$config_hint"
 
 echo "Ready in $project_dir. Ensure Azure Storage, Databricks, and RCLONE_CONFIG_BASE64 are set in .env."
 echo "Verified Google Drive access for gdrive."
-echo "Start training with 'bash scripts/train.sh', or open notebooks/evaluation.ipynb with $project_dir/.venv/bin/python as the kernel."
+echo "Start training with 'bash scripts/train.sh', or open evaluation notebooks/ (`phase3_...` through `phase4c_...`) with $project_dir/.venv/bin/python as the kernel."

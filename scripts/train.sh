@@ -15,10 +15,12 @@
 #   bash scripts/train.sh --preset small --stop-after 20
 #   bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
 #
-# Examples (Phase 4 Arithmetic SFT - prepare/inspect data first via scripts/prepare_sft_data.sh):
-#   bash scripts/prepare_sft_data.sh
+# Examples (Phase 4 Arithmetic SFT - prepare/inspect data first via scripts/prepare_data.sh):
+#   bash scripts/prepare_data.sh
+#   bash scripts/prepare_data.sh --format cot --multistep
 #   bash scripts/train.sh sft --preset sft_pilot
 #   bash scripts/train.sh sft --preset sft
+#   bash scripts/train.sh sft --preset sft_scratchpad
 #   bash scripts/train.sh sft --preset sft --context-length 2048
 #   bash scripts/train.sh sft --preset sft --base-run-id <BASE_RUN_ID> --checkpoint-alias latest
 #   bash scripts/train.sh sft --preset sft --max-digits 4
@@ -72,9 +74,11 @@ Commands:
 Examples:
   bash scripts/train.sh --preset base
   bash scripts/train.sh --preset base --resume --run-id <RUN_ID>
-  bash scripts/prepare_sft_data.sh
+  bash scripts/prepare_data.sh
+  bash scripts/prepare_data.sh --format cot --multistep
   bash scripts/train.sh sft --preset sft_pilot
   bash scripts/train.sh sft --preset sft
+  bash scripts/train.sh sft --preset sft_scratchpad
   bash scripts/train.sh sft --preset sft --context-length 2048
   bash scripts/train.sh sft --preset sft --resume --run-id <SFT_RUN_ID>
 EOF
@@ -84,7 +88,7 @@ EOF
     cd "$project_dir"
     eval "$py_cmd src/main.py --help"
     echo ""
-    eval "$py_cmd src/main.py prepare-sft-data --help"
+    eval "$py_cmd src/main.py prepare-data --help"
     echo ""
     eval "$py_cmd src/main.py sft --help"
 }

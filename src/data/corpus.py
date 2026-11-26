@@ -41,6 +41,7 @@ def ensure_tokenized_corpus(
     tokenized_path: Path | None = None,
     drive_data_root: str | None = None,
     tokenizer_device: str = "auto",
+    sync_drive: bool = True,
 ) -> dict:
     """Restore or prepare the packed `train.bin`/`val.bin` SimpleStories corpus."""
     if source_splits is None:
@@ -75,16 +76,18 @@ def ensure_tokenized_corpus(
         except Exception as exc:
             print(f"Local tokenized corpus verification failed ({exc}); checking Google Drive...")
 
-    manifest = reuse_tokenized(drive_data_root, tokenized_path, corpus_settings)
-    if manifest is not None:
-        print(f"Restored and verified packed data from Google Drive to {tokenized_path}.")
-        return manifest
+    if sync_drive:
+        manifest = reuse_tokenized(drive_data_root, tokenized_path, corpus_settings)
+        if manifest is not None:
+            print(f"Restored and verified packed data from Google Drive to {tokenized_path}.")
+            return manifest
 
     print("No prepared corpus found. Preparing SimpleStories dataset from scratch...")
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
     dataset = load_raw_training_stories(
         drive_data_root, cache_dir, dataset_name, SIMPLESTORIES_TRAIN_FILES,
         token=os.getenv("HF_TOKEN", "").strip() or None,
+        sync_drive=sync_drive,
     )
 
     split_indices = {"train": [], "val": []}
@@ -140,5 +143,6 @@ def ensure_tokenized_corpus(
         )
         publish_prepared_corpus(staging, tokenized_path)
 
-    publish_tokenized(drive_data_root, tokenized_path, corpus_settings)
+    if sync_drive:
+        publish_tokenized(drive_data_root, tokenized_path, corpus_settings)
     return manifest

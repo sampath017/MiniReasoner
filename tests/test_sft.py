@@ -20,10 +20,13 @@ from src.core.model import GPT, GPTConfig
 from src.core.tokenizer import EOS, sha256
 from src.data.arithmetic import (
     GENERATOR_VERSION,
+    SCRATCHPAD_GENERATOR_VERSION,
     build_arithmetic_dataset,
     canonical_problem,
     collate_sft_batch,
+    dataset_slug,
     encode_sft_example,
+    format_work_trace,
     load_or_restore_arithmetic_dataset,
     prepare_arithmetic_dataset,
     score_arithmetic_completion,
@@ -307,6 +310,269 @@ def test_run_sft_end_to_end():
     print("  [PASSED] End-to-end Phase 4 SFT pilot reading prepared dataset with 4 ops & retention")
 
 
+def _assert_valid_work_trace(work_line: str, expected_answer: int) -> None:
+    assert work_line.startswith("Work: "), f"Missing Work prefix: {work_line!r}"
+    parts = [p.strip() for p in work_line[len("Work: "):].split(";")]
+    assert parts and all(parts)
+    last_val = None
+    for part in parts:
+        lhs, rhs = part.split("=", 1)
+        rhs_val = int(rhs)
+        if lhs == "neg":
+            assert last_val is not None and rhs_val == -last_val
+        elif "/" in lhs:
+            a_s, b_s = lhs.split("/", 1)
+            a_i = int(a_s)
+            b_i = int(b_s.strip("()"))
+            assert a_i % b_i == 0 and (a_i // b_i == rhs_val or (-1 if (a_i < 0) ^ (b_i < 0) else 1) * (abs(a_i) // abs(b_i)) == rhs_val)
+        else:
+            cleaned_lhs = lhs.replace("(", "").replace(")", "")
+            assert eval(cleaned_lhs, {"__builtins__": {}}, {}) == rhs_val
+        last_val = rhs_val
+    assert last_val == expected_answer, f"{work_line!r} ended with {last_val}, expected {expected_answer}"
+
+
+def test_scratchpad_traces_multistep_and_verifier():
+    """Verify numeric Work traces, multi-step conversational generation, leakage-free splits, and parser."""
+    edge_cases = [
+        canonical_problem("mul", 177, 515),
+        canonical_problem("mul", -95, 672),
+        canonical_problem("mul", 6, 45),
+        canonical_problem("mul", 0, -99),
+        canonical_problem("add", -36, 545),
+        canonical_problem("add", 89, 498),
+        canonical_problem("add", -545, 36),
+        canonical_problem("add", -120, -45),
+        canonical_problem("sub", -494, -377),
+        canonical_problem("sub", 475, 256),
+        canonical_problem("sub", 1, 881),
+        canonical_problem("sub", 36, -545),
+        canonical_problem("div", 624, 16),
+        canonical_problem("div", -998, -1),
+        canonical_problem("div", 0, -17),
+        canonical_problem("mod", 58, 8),
+    ]
+    for prob in edge_cases:
+        _assert_valid_work_trace(format_work_trace(prob), prob.answer)
+
+    slug = dataset_slug(answer_format="scratchpad", include_multistep=True)
+    assert slug.startswith(f"{SCRATCHPAD_GENERATOR_VERSION}_scratchpad_multistep_")
+
+    splits, manifest = build_arithmetic_dataset(
+        samples_per_op=200, seed=42, answer_format="scratchpad", include_multistep=True,
+    )
+    assert manifest["generator_version"] == SCRATCHPAD_GENERATOR_VERSION
+    assert manifest["answer_format"] == "scratchpad"
+    assert manifest["include_multistep"] is True
+    assert set(manifest["op_counts"]["val"]) == {"add", "sub", "mul", "div", "multi"}
+
+    ids_by_split = {name: {ex.canonical_id for ex in items} for name, items in splits.items()}
+    assert ids_by_split["train"].isdisjoint(ids_by_split["val"])
+    assert ids_by_split["train"].isdisjoint(ids_by_split["test"])
+    assert ids_by_split["val"].isdisjoint(ids_by_split["test"])
+
+    val_categories = {ex.category for ex in splits["val"]}
+    for expected_cat in ("multi_seq_sym", "multi_seq_word", "multi_combine_sym", "multi_combine_word", "multi_pemdas"):
+        assert expected_cat in val_categories
+
+    for items in splits.values():
+        for ex in items:
+            assert ex.prompt.endswith("\n") and not ex.prompt.endswith("\nAnswer:")
+            work_line, ans_line = ex.answer_text.split("\n", 1)
+            assert ans_line == f"Answer: {ex.answer}"
+            _assert_valid_work_trace(work_line, ex.answer)
+            verdict = score_arithmetic_completion(ex.answer_text, ex.answer, answer_format="scratchpad")
+            assert verdict == {"valid_format": True, "extracted": ex.answer, "exact_match": True, "reward": 1.0}
+
+    for bad in (
+        "25",
+        "Answer: 25",
+        "Work: \nAnswer: 25",
+        "Work: 10+10=20\nAnswer: 20 extra",
+        "Work: 10+10=20\nAnswer: 20\nAnswer: 20",
+    ):
+        res = score_arithmetic_completion(bad, 25, answer_format="scratchpad")
+        assert res["valid_format"] is False and res["reward"] == 0.0
+    print("  [PASSED] Numeric scratchpad traces, multi-step conversational splits, and verifier")
+
+
+def test_run_sft_scratchpad_end_to_end():
+    """Verify full SFT loop with scratchpad + multi-step preset, dynamic eval token budget, and logging."""
+    tok = _make_byte_tokenizer()
+    vocab_size = tok.get_vocab_size()
+    base_cfg = GPTConfig(vocab_size=vocab_size, context_length=256, n_layer=2, n_head=4, n_embd=64)
+    base_model = GPT(base_cfg)
+    container = _FakeContainer()
+    run_handle = _FakeRunHandle("sft_scratchpad_test")
+
+    @contextmanager
+    def fake_track_run(*args, **kwargs):
+        yield run_handle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        logs_dir = tmp / "logs"
+        data_dir = tmp / "prepared_scratchpad"
+        prepare_arithmetic_dataset(
+            output_dir=data_dir,
+            samples_per_op=120,
+            seed=42,
+            answer_format="scratchpad",
+            include_multistep=True,
+            sync_drive=False,
+        )
+
+        base_ckpt_path = tmp / "run_base" / "latest_step_26047.pt"
+        base_ckpt_path.parent.mkdir(parents=True)
+        torch.save({
+            "version": 1,
+            "model_config": asdict(base_cfg),
+            "model": base_model.state_dict(),
+            "tokenizer_json": tok.to_str(),
+            "step": 26047,
+            "metrics": [{"step": 26047, "val_loss": 1.1303}],
+        }, base_ckpt_path)
+
+        tok_dir = tmp / "tokenized"
+        tok_dir.mkdir()
+        tok.save(str(tok_dir / "tokenizer.json"))
+        arr = np.arange(512, dtype=np.uint16) % vocab_size
+        arr.tofile(tok_dir / "train.bin")
+        arr.tofile(tok_dir / "val.bin")
+        manifest = {
+            "version": 1,
+            "vocab_size": vocab_size,
+            "tokenizer_sha256": sha256(tok_dir / "tokenizer.json"),
+            "train": {"tokens": len(arr), "sha256": sha256(tok_dir / "train.bin")},
+            "val": {"tokens": len(arr), "sha256": sha256(tok_dir / "val.bin")},
+        }
+
+        with (
+            patch.dict("os.environ", {"DATABRICKS_HOST": "https://example.cloud.databricks.com", "DATABRICKS_TOKEN": "tok"}),
+            patch.object(azure_blob, "container_client", return_value=container),
+            patch.object(checkpoint_store, "container_client", return_value=container),
+            patch("src.training.sft.ensure_tokenized_corpus", return_value=manifest),
+            patch("src.training.common.track_run", fake_track_run),
+        ):
+            res = sft.run_sft(
+                preset="sft_scratchpad",
+                data_dir=data_dir,
+                samples_per_op=120,
+                no_drive=True,
+                base_checkpoint=base_ckpt_path,
+                context_length=256,
+                steps=4,
+                batch_size=4,
+                eval_every=2,
+                retention_ratio=0.25,
+                device=torch.device("cpu"),
+                logs_dir=logs_dir,
+                retention_tokenized_dir=tok_dir,
+            )
+
+        assert res["status"] == "Completed" and res["step"] == 4
+        assert res["answer_format"] == "scratchpad" and res["include_multistep"] is True
+        assert set(res["op_accuracy"]) == {"add", "sub", "mul", "div", "multi"}
+        assert run_handle.tags["arith_format"] == "scratchpad"
+    print("  [PASSED] End-to-end Phase 4 SFT scratchpad & multi-step loop")
+
+
+def test_prepare_data_cot_alias_and_benchmark_helpers():
+    """Verify `cot` alias, stratified evaluation subsets, `--stage corpus --no-drive`, and KV-cache helpers."""
+    from src import main as cli_main
+    from src.core.benchmark import (
+        benchmark_kv_cache_parity,
+        create_ask_helper,
+        create_math_chat_helpers,
+        evaluate_arithmetic_split,
+        evaluate_wording_generalization,
+        is_math_prompt,
+    )
+    from src.data.arithmetic import normalize_answer_format
+
+    assert normalize_answer_format("cot") == "scratchpad"
+    assert normalize_answer_format("scratchpad") == "scratchpad"
+    assert normalize_answer_format("direct") == "direct"
+
+    tok = _make_byte_tokenizer()
+    cfg = GPTConfig(vocab_size=tok.get_vocab_size(), context_length=128, n_layer=2, n_head=4, n_embd=64)
+    model = GPT(cfg).eval()
+    device = torch.device("cpu")
+
+    parity = benchmark_kv_cache_parity(
+        model,
+        tok,
+        ["What is 12 + 34?\n", "Calculate 99 - 41.\n"],
+        device=device,
+        max_new_tokens=16,
+        batch_size=2,
+    )
+    assert parity["seq_parity"] is True
+    assert parity["batch_parity"] is True
+
+    ask_cot, _ = create_math_chat_helpers(model, tok, device=device, answer_format="cot", use_cache=True)
+    cot_out = ask_cot("What is 2 + 2?", max_new_tokens=8, verbose=False)
+    assert isinstance(cot_out["completion"], str) and cot_out["elapsed_seconds"] >= 0.0
+
+    ask_direct, _ = create_math_chat_helpers(model, tok, device=device, answer_format="direct", use_cache=False)
+    direct_out = ask_direct("What is 2 + 2?", max_new_tokens=8, verbose=False)
+    assert isinstance(direct_out["completion"], str) and direct_out["elapsed_seconds"] >= 0.0
+
+    assert is_math_prompt("What is 47 + 8?") is True
+    assert is_math_prompt("What is twelve plus eight?") is True
+    assert is_math_prompt("Start with 100, subtract 35, and multiply by 4.") is True
+    assert is_math_prompt("Once upon a time") is False
+    assert is_math_prompt("Once upon a time, 3 little foxes lived in a forest.") is False
+
+    ask = create_ask_helper(model, tok, device=device, answer_format="direct", use_cache=True)
+    story_out = ask("Once upon a time", max_new_tokens=8, verbose=False)
+    assert story_out["mode"] == "story" and story_out["full_text"].startswith("Once upon a time")
+    math_out = ask("What is 47 + 8?", max_new_tokens=8, verbose=False)
+    assert math_out["mode"] == "math" and "valid_format" in math_out
+    forced_story = ask("2 + 2", mode="story", max_new_tokens=6, verbose=False)
+    assert forced_story["mode"] == "story"
+    try:
+        ask("hello", mode="bad")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected ValueError for invalid ask() mode")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir) / "arith_dir"
+        _, splits, manifest = prepare_arithmetic_dataset(
+            output_dir=out_dir, samples_per_op=100, seed=42, sync_drive=False,
+        )
+        with patch("src.core.benchmark.load_eval_arithmetic_dataset", return_value=(out_dir, splits, manifest)):
+            eval_out = evaluate_arithmetic_split(
+                model,
+                tok,
+                cfg,
+                manifest,
+                device=device,
+                dtype=torch.float32,
+                max_examples=12,
+                batch_size=6,
+                use_kv_cache=True,
+                max_misses_to_show=0,
+            )
+        assert len(eval_out["examples"]) == 12
+        assert set(eval_out["op_stats"]) == {"add", "div", "mul", "sub"}
+
+        # Sorted val rows start with ~100 add examples; wording probes must still cover all 4 ops when n_problems=4.
+        with patch("src.core.benchmark.canonical_problem", wraps=canonical_problem) as spy_canon:
+            evaluate_wording_generalization(
+                model, tok, splits["val"], device=device, answer_format="direct", n_problems=4, max_new_tokens=4, use_kv_cache=True,
+            )
+        probed_ops = {call.args[0] for call in spy_canon.call_args_list}
+        assert probed_ops == {"add", "sub", "mul", "div"}
+
+    with patch.object(cli_main, "ensure_tokenized_corpus", return_value={}) as mock_corpus:
+        cli_main.main(["prepare-data", "--stage", "corpus", "--no-drive"])
+        assert mock_corpus.call_args.kwargs["sync_drive"] is False
+    print("  [PASSED] `cot` alias, stratified benchmark/wording subsets, and `--stage corpus --no-drive`")
+
+
 if __name__ == "__main__":
     print("Running Phase 4 Arithmetic SFT test suite...")
     test_arithmetic_all_ops_digits_and_splits()
@@ -314,4 +580,7 @@ if __name__ == "__main__":
     test_sft_masking_and_verifier()
     test_rope_context_extension_for_sft()
     test_run_sft_end_to_end()
+    test_scratchpad_traces_multistep_and_verifier()
+    test_run_sft_scratchpad_end_to_end()
+    test_prepare_data_cot_alias_and_benchmark_helpers()
     print("All tests in test_sft.py passed successfully!")

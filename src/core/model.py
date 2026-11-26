@@ -61,14 +61,15 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.max_seq_len = seq_len
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, *, offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len = q.size(2)
-        if seq_len > self.max_seq_len:
-            self._build_cache(max(seq_len, self.max_seq_len * 2), device=q.device)
+        total_len = offset + seq_len
+        if total_len > self.max_seq_len:
+            self._build_cache(max(total_len, self.max_seq_len * 2), device=q.device)
         elif self.cos.device != q.device:
             self._build_cache(self.max_seq_len, device=q.device)
-        cos = self.cos[:, :, :seq_len, :]
-        sin = self.sin[:, :, :seq_len, :]
+        cos = self.cos[:, :, offset:total_len, :]
+        sin = self.sin[:, :, offset:total_len, :]
         return apply_rotary_pos_emb(q, cos, sin), apply_rotary_pos_emb(k, cos, sin)
 
 
@@ -86,13 +87,30 @@ class CausalSelfAttention(nn.Module):
             theta=config.rope_theta,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ):
         batch, length, n_embd = x.shape
+        if past_kv is not None and length > 1:
+            raise ValueError("Incremental KV caching expects single-token decode steps (length == 1).")
         qkv = self.c_attn(x).reshape(batch, length, 3, self.n_head, self.head_dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind()
-        q, k = self.rotary(query, key)
-        attended = F.scaled_dot_product_attention(q, k, value, is_causal=True)
-        return self.c_proj(attended.transpose(1, 2).reshape(batch, length, n_embd))
+        offset = past_kv[0].size(2) if past_kv is not None else 0
+        q, k = self.rotary(query, key, offset=offset)
+        if past_kv is not None:
+            k = torch.cat((past_kv[0], k), dim=2)
+            v = torch.cat((past_kv[1], value), dim=2)
+        else:
+            v = value
+        attended = F.scaled_dot_product_attention(q, k, v, is_causal=(past_kv is None))
+        out = self.c_proj(attended.transpose(1, 2).reshape(batch, length, n_embd))
+        if use_cache:
+            return out, (k, v)
+        return out
 
 
 class MLP(nn.Module):
@@ -114,8 +132,18 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ):
+        if use_cache:
+            attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True)
+            x = x + attn_out
+            return x + self.mlp(self.ln_2(x)), present_kv
+        x = x + self.attn(self.ln_1(x), past_kv=past_kv)
         return x + self.mlp(self.ln_2(x))
 
 
@@ -143,11 +171,27 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        use_cache: bool = False,
+    ):
+        offset = past_kvs[0][0].size(2) if past_kvs is not None else 0
         length = input_ids.size(1)
-        if length > self.config.context_length:
+        if offset + length > self.config.context_length:
             raise ValueError("Input exceeds the configured context length")
         hidden = self.transformer.wte(input_ids)
-        for block in self.transformer.h:
-            hidden = block(hidden)
-        return self.lm_head(self.transformer.ln_f(hidden))
+        next_kvs = [] if use_cache else None
+        for idx, block in enumerate(self.transformer.h):
+            layer_past = past_kvs[idx] if past_kvs is not None else None
+            if use_cache:
+                hidden, present_kv = block(hidden, past_kv=layer_past, use_cache=True)
+                next_kvs.append(present_kv)
+            else:
+                hidden = block(hidden, past_kv=layer_past)
+        logits = self.lm_head(self.transformer.ln_f(hidden))
+        if use_cache:
+            return logits, next_kvs
+        return logits

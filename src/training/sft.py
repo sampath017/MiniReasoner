@@ -29,6 +29,7 @@ from ..data.arithmetic import (
     collate_sft_batch,
     encode_sft_split,
     load_or_restore_arithmetic_dataset,
+    normalize_answer_format,
     normalize_ops,
     score_arithmetic_completion,
     select_stratified_eval_problems,
@@ -89,6 +90,7 @@ def evaluate_sft(
     step: int = 0,
     max_new_tokens: int = 24,
     max_failures_to_log: int = 5,
+    answer_format: str = "direct",
 ) -> dict:
     """Compute masked val loss, greedy exact-match/op/category breakdown, and story retention loss."""
     was_training = model.training
@@ -114,7 +116,7 @@ def evaluate_sft(
             raw = generate_text(
                 model, tokenizer, item.prompt, max_new_tokens=max_new_tokens, device=device, temperature=0.0,
             )
-            verdict = score_arithmetic_completion(raw, item.answer)
+            verdict = score_arithmetic_completion(raw, item.answer, answer_format=answer_format)
             cat_stats = per_cat.setdefault(item.category, [0, 0])
             cat_stats[1] += 1
             op_stats = per_op.setdefault(item.op, [0, 0])
@@ -172,8 +174,8 @@ def _log_val_summary(eval_res: dict, *, step: int, loss_decimals: int) -> None:
         print("  Categories: " + ", ".join(parts), flush=True)
     if eval_res["sample_failures"]:
         for item, raw in eval_res["sample_failures"]:
-            preview = raw.strip().replace("\n", "\\n")[:40]
-            prompt_one_line = item.prompt.replace("\n", " ")
+            preview = raw.strip().replace("\n", "\\n")[:140]
+            prompt_one_line = item.prompt.replace("\n", " ").strip()
             print(f"  [MISS] {item.category} | {prompt_one_line} -> {preview!r} (expected {item.answer})", flush=True)
 
 
@@ -185,6 +187,8 @@ def run_sft(
     max_digits: int | None = None,
     allow_negative: bool | None = None,
     samples_per_op: int | None = None,
+    answer_format: str | None = None,
+    include_multistep: bool | None = None,
     no_drive: bool = False,
     base_run_id: str | None = None,
     base_checkpoint_alias: str | None = None,
@@ -221,6 +225,8 @@ def run_sft(
     n_digits = max_digits if max_digits is not None else cfg_defaults["max_digits"]
     neg_allowed = allow_negative if allow_negative is not None else cfg_defaults["allow_negative"]
     n_samples = samples_per_op if samples_per_op is not None else cfg_defaults["samples_per_op"]
+    fmt = normalize_answer_format(answer_format if answer_format is not None else cfg_defaults["answer_format"])
+    with_multistep = include_multistep if include_multistep is not None else bool(cfg_defaults["include_multistep"])
     ret_ratio = 0.0 if disable_retention else (
         retention_ratio if retention_ratio is not None else cfg_defaults["retention_ratio"]
     )
@@ -266,14 +272,17 @@ def run_sft(
             allow_negative=neg_allowed,
             samples_per_op=n_samples,
             seed=run_seed,
+            answer_format=fmt,
+            include_multistep=with_multistep,
             use_drive=not no_drive,
         )
         effective_digits = int(arith_manifest.get("max_digits", n_digits))
-        max_answer_tokens = max(24, effective_digits * 2 + 6)
+        effective_format = normalize_answer_format(arith_manifest.get("answer_format", fmt))
+        effective_multistep = bool(arith_manifest.get("include_multistep", with_multistep))
         print(
             f"Loaded prepared dataset ({arith_manifest.get('generator_version', GENERATOR_VERSION)}) from {resolved_data_dir}: "
             f"ops={arith_manifest.get('ops')}, max_digits={effective_digits}, "
-            f"negatives={arith_manifest.get('allow_negative')}, "
+            f"negatives={arith_manifest.get('allow_negative')}, format={effective_format}, multistep={effective_multistep}, "
             f"train={len(arith_splits['train']):,} examples, val={len(arith_splits['val']):,}, "
             f"sealed_test={len(arith_splits['test']):,} (reserved for Phase 6)",
             flush=True,
@@ -311,6 +320,9 @@ def run_sft(
         val_eval_items = select_stratified_eval_problems(
             arith_splits["val"], cfg_defaults["val_eval_problems"], seed=run_seed,
         )
+        max_val_target_tokens = max((sum(1 for t in y if t != -100) for _, y in val_encoded), default=0)
+        base_budget = 24 if effective_format == "direct" else 96
+        max_answer_tokens = max(base_budget, effective_digits * 2 + 6, max_val_target_tokens + 24)
 
         # Optional SimpleStories retention streams
         story_train_stream = None
@@ -401,6 +413,8 @@ def run_sft(
                 "ops": ",".join(arith_manifest.get("ops", op_list)),
                 "max_digits": effective_digits,
                 "allow_negative": arith_manifest.get("allow_negative", neg_allowed),
+                "answer_format": effective_format,
+                "include_multistep": effective_multistep,
                 "dataset_dir": str(resolved_data_dir),
             },
             log_path=log_path,
@@ -414,6 +428,7 @@ def run_sft(
                 "parent_checkpoint_step": str(parent_step),
                 "base_checkpoint_alias": alias,
                 "arith_generator_version": str(arith_manifest.get("generator_version", GENERATOR_VERSION)),
+                "arith_format": effective_format,
                 "context_length": str(model_config.context_length),
             },
         ) as (session, check_stop):
@@ -432,7 +447,7 @@ def run_sft(
                     model, tokenizer, val_encoded, val_eval_items,
                     batch_size=train_cfg.batch_size, pad_id=eos_id, device=device, precision=precision,
                     story_val_stream=story_val_stream, retention_config=retention_eval_cfg, step=0,
-                    max_new_tokens=max_answer_tokens,
+                    max_new_tokens=max_answer_tokens, answer_format=effective_format,
                 )
                 val_loss = last_eval["val_arith_loss"]
                 _log_val_summary(last_eval, step=0, loss_decimals=loss_decimals)
@@ -501,7 +516,7 @@ def run_sft(
                     model, tokenizer, val_encoded, val_eval_items,
                     batch_size=train_cfg.batch_size, pad_id=eos_id, device=device, precision=precision,
                     story_val_stream=story_val_stream, retention_config=retention_eval_cfg, step=step,
-                    max_new_tokens=max_answer_tokens,
+                    max_new_tokens=max_answer_tokens, answer_format=effective_format,
                 )
                 val_loss = last_eval["val_arith_loss"]
                 elapsed = max(1e-6, perf_counter() - interval_start)
@@ -565,6 +580,8 @@ def run_sft(
             "mlflow_run_id": active_run_id,
             "log_path": str(log_path),
             "dataset_dir": str(resolved_data_dir),
+            "answer_format": effective_format,
+            "include_multistep": effective_multistep,
             "parent_run_id": parent_run_id,
             "parent_checkpoint_step": parent_step,
         }

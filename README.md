@@ -93,9 +93,16 @@ python src/main.py --preset base
 python src/main.py --preset base --resume --run-id <MLFLOW_RUN_ID>
 ```
 
-### Evaluation & Inference Notebook
+### Phase-by-Phase Evaluation Notebooks
+Use the compartmentalized evaluation notebooks under `notebooks/` (backed by shared helpers in `src/infra/eval_setup.py` and `src/core/benchmark.py`):
+- [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) — Phase 3 Base Model Evaluation (`32.05M` RoPE architecture & convergence curves, `SimpleStories` test PPL/BPB, Story Cloze `story_mc_acc`, RoPE position scaling, pre-SFT arithmetic baseline, throughput)
+- [phase4a_sft_direct.ipynb](notebooks/phase4a_sft_direct.ipynb) — Phase 4a Direct SFT (`arith_v2`, `Answer: <int>`)
+- [phase4b_sft_cot.ipynb](notebooks/phase4b_sft_cot.ipynb) — Phase 4b CoT Scratchpad + Multi-Step SFT (`arith_v3`, `Work: ... \nAnswer: <int>`)
+- [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) — Phase 4c CoT SFT with KV Cache (parity/speedup benchmark, full `6,002`-row `val` evaluation, fast local `ask_math` / `chat_math` playground)
 
-Use [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) to inspect checkpoints from Azure Blob Storage, plot convergence curves, evaluate perplexity/BPB and Story Cloze accuracy, test arithmetic baselines, and generate stories on both CPU and GPU. See [COOKBOOK.md](COOKBOOK.md) for the complete end-to-end build, training, post-training SFT/RL, and release plan.
+Note: Phase 1 data preparation and Phase 2/4 training run via `bash scripts/prepare_data.sh` and `bash scripts/train.sh`; notebooks are strictly for evaluation and interactive testing.
+
+See [COOKBOOK.md](COOKBOOK.md) for the complete end-to-end build, training, post-training SFT/RL, and release plan.
 
 ## Reuse the corpus and save checkpoints
 
@@ -114,7 +121,7 @@ A fresh VM downloads the prepared corpus from Drive and verifies its file sizes 
 
 Uploads run in the background after validation. The training runner waits for pending uploads on completion or `SIGINT`/`SIGTERM`. `CHECKPOINT_LIMIT = None` keeps every checkpoint. To resume on a GPU VM, pass `--resume --run-id <MLFLOW_RUN_ID>` to `bash scripts/train.sh` or `python src/main.py` using the same storage container, experiment path, corpus, and training settings.
 
-When the run is complete, open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) with the project's `.venv` kernel (on either a local CPU machine or a CUDA GPU VM) to auto-select the best checkpoint from Azure, inspect metrics, and run inference benchmarks.
+When the run is complete, open the corresponding phase notebook under `notebooks/` (e.g. [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) or [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb)) with the project's `.venv` kernel (on either a local CPU machine or a CUDA GPU VM) to auto-select checkpoints from Azure, inspect metrics, and run inference benchmarks.
 
 To remove Azure checkpoints for runs you deleted in the Databricks MLflow UI:
 
@@ -128,4 +135,4 @@ uv run python src/main.py cleanup --delete
 
 ## CPU inference
 
-Open [notebooks/evaluation.ipynb](notebooks/evaluation.ipynb) on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to select the latest Azure run's lowest-loss checkpoint, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.core.generate.complete()` directly from Python.
+Open any phase notebook in `notebooks/` on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to auto-select the newest matching run for that phase, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.core.generate.complete()` directly from Python.

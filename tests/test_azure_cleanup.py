@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from src.infra import azure_blob, checkpoint_store, tracking
-from src.main import build_cleanup_parser, build_prepare_sft_data_parser, build_sft_parser, build_train_parser
+from src.main import build_cleanup_parser, build_prepare_data_parser, build_sft_parser, build_train_parser
 from src.settings import PRESETS
 from src.training import pretrain
 
@@ -164,23 +164,28 @@ def test_transient_mlflow_error_aborts_cleanly():
 
 
 def test_cli_parsers():
-    """Verify train, prepare-sft-data, sft, and cleanup argument parsers remain clean and compatible."""
+    """Verify train, prepare-data, sft, and cleanup argument parsers remain clean and compatible."""
     train_args = build_train_parser().parse_args(["--preset", "small", "--stop-after", "5"])
     assert train_args.preset == "small" and train_args.stop_after == 5
 
-    prep_args = build_prepare_sft_data_parser().parse_args([
+    prep_args = build_prepare_data_parser().parse_args([
+        "--stage", "sft", "--format", "cot", "--multistep",
         "--ops", "add", "sub", "mul", "div", "mod", "--max-digits", "4", "--val-fraction", "0.1", "--nonnegative-only", "--no-drive",
     ])
+    assert prep_args.stage == "sft" and prep_args.format == "cot" and prep_args.multistep is True
     assert prep_args.max_digits == 4 and prep_args.val_fraction == 0.1 and prep_args.nonnegative_only and prep_args.no_drive
 
+    corpus_prep = build_prepare_data_parser().parse_args(["--stage", "corpus", "--tokenizer-device", "cpu"])
+    assert corpus_prep.stage == "corpus" and corpus_prep.tokenizer_device == "cpu"
+
     sft_args = build_sft_parser().parse_args([
-        "--preset", "sft_pilot", "--max-digits", "4", "--nonnegative-only", "--context-length", "2048", "--no-retention",
+        "--preset", "sft_pilot", "--format", "cot", "--max-digits", "4", "--nonnegative-only", "--context-length", "2048", "--no-retention",
     ])
-    assert sft_args.preset == "sft_pilot" and sft_args.max_digits == 4 and sft_args.context_length == 2048 and sft_args.no_retention
+    assert sft_args.preset == "sft_pilot" and sft_args.format == "cot" and sft_args.max_digits == 4 and sft_args.context_length == 2048 and sft_args.no_retention
 
     cleanup_args = build_cleanup_parser().parse_args(["--delete", "--yes", "--include-missing"])
     assert cleanup_args.delete and cleanup_args.yes and cleanup_args.include_missing
-    print("  [PASSED] CLI train, prepare-sft-data, sft & cleanup argument parsers")
+    print("  [PASSED] CLI train, prepare-data, sft & cleanup argument parsers")
 
 
 class _FakeRunHandle:

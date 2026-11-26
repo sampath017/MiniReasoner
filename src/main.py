@@ -13,7 +13,8 @@ if str(project_root) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(project_root / ".env")
 
-from src.data.arithmetic import SUPPORTED_OPS, prepare_arithmetic_dataset
+from src.data.arithmetic import ANSWER_FORMAT_CHOICES, SUPPORTED_OPS, prepare_arithmetic_dataset
+from src.data.corpus import ensure_tokenized_corpus
 from src.infra.tracking import sync_deleted_runs
 from src.settings import AZURE_CONTAINER, MLFLOW_EXPERIMENT, PRESETS, SFT_DATA_DEFAULTS, SFT_PRESETS
 from src.training.pretrain import run_training
@@ -27,7 +28,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         epilog=(
             "Subcommands:\n"
             "  train                Pretrain a MiniReasoner base model (default command)\n"
-            "  prepare-sft-data     Generate, preview, save, and cache Phase 4 arithmetic SFT data\n"
+            "  prepare-data         Generate, preview, save, and cache Phase 1 corpus or Phase 4 SFT data\n"
             "  sft                  Phase 4 Arithmetic Supervised Fine-Tuning from a prepared dataset\n"
             "  cleanup (sync-azure) Preview or delete Azure checkpoints for MLflow runs deleted in Databricks\n\n"
             "Run `python src/main.py <subcommand> --help` for options."
@@ -83,10 +84,16 @@ def build_train_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_prepare_sft_data_parser() -> argparse.ArgumentParser:
+def build_prepare_data_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m src.main prepare-sft-data",
-        description="Generate, inspect, save to disk, and cache Phase 4 arithmetic SFT splits to Google Drive.",
+        prog="python -m src.main prepare-data",
+        description="Generate, inspect, save to disk, and cache Phase 1 SimpleStories corpus or Phase 4 arithmetic SFT splits (`direct` vs `cot`).",
+    )
+    parser.add_argument(
+        "--stage",
+        default="sft",
+        choices=["sft", "corpus"],
+        help="Dataset stage to prepare: 'sft' arithmetic splits (default) or 'corpus' SimpleStories tokens.",
     )
     parser.add_argument(
         "--ops",
@@ -112,6 +119,18 @@ def build_prepare_sft_data_parser() -> argparse.ArgumentParser:
         help=f"Target canonical problems per operation (default: {SFT_DATA_DEFAULTS['samples_per_op']:,}).",
     )
     parser.add_argument(
+        "--format",
+        default=SFT_DATA_DEFAULTS["answer_format"],
+        choices=list(ANSWER_FORMAT_CHOICES),
+        help="SFT target format: 'direct' (normal `Answer: 55`) or 'cot' / 'scratchpad' (`Work: ...\\nAnswer: 55`).",
+    )
+    parser.add_argument(
+        "--multistep",
+        action=argparse.BooleanOptionalAction,
+        default=SFT_DATA_DEFAULTS["include_multistep"],
+        help="Include multi-step chained expressions and conversational math prompts.",
+    )
+    parser.add_argument(
         "--val-fraction",
         type=float,
         default=SFT_DATA_DEFAULTS["val_fraction"],
@@ -127,7 +146,7 @@ def build_prepare_sft_data_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="Optional custom directory for generated train/val/test JSONL splits.",
+        help="Optional custom directory for generated splits.",
     )
     parser.add_argument(
         "--seed",
@@ -136,9 +155,15 @@ def build_prepare_sft_data_parser() -> argparse.ArgumentParser:
         help="Random seed for stratified generation and splitting (default: 42).",
     )
     parser.add_argument(
+        "--tokenizer-device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for training BPE tokenizer when --stage corpus runs from scratch (default: auto).",
+    )
+    parser.add_argument(
         "--no-drive",
         action="store_true",
-        help="Skip uploading the generated dataset to Google Drive.",
+        help="Skip uploading the generated SFT dataset to Google Drive.",
     )
     parser.add_argument(
         "--overwrite",
@@ -179,6 +204,18 @@ def build_sft_parser() -> argparse.ArgumentParser:
         help="Match a nonnegative-only dataset instead of default signed arithmetic.",
     )
     parser.add_argument("--samples-per-op", type=int, default=None, help="Canonical problems per op (default: 12000).")
+    parser.add_argument(
+        "--format",
+        default=None,
+        choices=list(ANSWER_FORMAT_CHOICES),
+        help="Override target format ('direct' vs 'cot' / 'scratchpad').",
+    )
+    parser.add_argument(
+        "--multistep",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include multi-step chained expressions and conversational math prompts.",
+    )
     parser.add_argument(
         "--no-drive",
         action="store_true",
@@ -281,20 +318,30 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    if raw_argv and raw_argv[0] in ("prepare-sft-data", "prepare-data"):
-        args = build_prepare_sft_data_parser().parse_args(raw_argv[1:])
-        prepare_arithmetic_dataset(
-            output_dir=args.output_dir,
-            ops=args.ops,
-            max_digits=args.max_digits,
-            allow_negative=not args.nonnegative_only,
-            samples_per_op=args.samples_per_op,
-            val_fraction=args.val_fraction,
-            test_fraction=args.test_fraction,
-            seed=args.seed,
-            sync_drive=not args.no_drive,
-            overwrite=args.overwrite,
-        )
+    if raw_argv and raw_argv[0] in ("prepare-data", "prepare-sft-data"):
+        args = build_prepare_data_parser().parse_args(raw_argv[1:])
+        if args.stage == "corpus":
+            ensure_tokenized_corpus(
+                seed=args.seed,
+                tokenized_path=args.output_dir,
+                tokenizer_device=args.tokenizer_device,
+                sync_drive=not args.no_drive,
+            )
+        else:
+            prepare_arithmetic_dataset(
+                output_dir=args.output_dir,
+                ops=args.ops,
+                max_digits=args.max_digits,
+                allow_negative=not args.nonnegative_only,
+                samples_per_op=args.samples_per_op,
+                val_fraction=args.val_fraction,
+                test_fraction=args.test_fraction,
+                seed=args.seed,
+                answer_format=args.format,
+                include_multistep=args.multistep,
+                sync_drive=not args.no_drive,
+                overwrite=args.overwrite,
+            )
         return
 
     if raw_argv and raw_argv[0] == "sft":
@@ -307,6 +354,8 @@ def main(argv: list[str] | None = None) -> None:
             max_digits=args.max_digits,
             allow_negative=allow_negative,
             samples_per_op=args.samples_per_op,
+            answer_format=args.format,
+            include_multistep=args.multistep,
             no_drive=args.no_drive,
             base_run_id=args.base_run_id,
             base_checkpoint_alias=args.checkpoint_alias,

@@ -18,8 +18,9 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from src.core.checkpoint import load_checkpoint
-from src.core.generate import complete
+from src.core.generate import complete, generate_batch_greedy, generate_text
 from src.core.model import GPT, GPTConfig
+from src.core.tokenizer import EOS
 from src.settings import PRESETS, VOCAB_SIZE
 from src.training.common import EpochBatchSampler, TokenStream, TrainConfig
 
@@ -218,6 +219,48 @@ def test_sampler_and_checkpoint_compatibility():
         assert is_mismatched, "Expected mismatched old checkpoint to be rejected by run_identity!"
 
 
+def test_kv_cache_and_batched_greedy_parity():
+    """Verify KV-cached incremental decoding and equal-length batched greedy match full-sequence outputs."""
+    from tokenizers import decoders, models, pre_tokenizers
+
+    vocab = {EOS: 0}
+    for i in range(256):
+        ch = bytes([i]).decode("latin-1")
+        if ch not in vocab:
+            vocab[ch] = len(vocab)
+    tok = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+
+    cfg = GPTConfig(vocab_size=tok.get_vocab_size(), context_length=32, n_layer=2, n_head=4, n_embd=64)
+    torch.manual_seed(7)
+    model = GPT(cfg).eval()
+
+    x = torch.randint(1, cfg.vocab_size, (2, 12))
+    with torch.no_grad():
+        full_logits = model(x)
+        prefill_logits, kvs = model(x[:, :8], use_cache=True)
+        step_logits = [prefill_logits]
+        for idx in range(8, 12):
+            step_out, kvs = model(x[:, idx : idx + 1], past_kvs=kvs, use_cache=True)
+            step_logits.append(step_out)
+        cat_logits = torch.cat(step_logits, dim=1)
+    assert torch.allclose(full_logits, cat_logits, atol=1e-5), "KV-cache logits drifted from full forward!"
+
+    prompts = ["1+1=", "12+34=", "9+8=", "100+200="]
+    cpu = torch.device("cpu")
+    uncached_outs = [generate_text(model, tok, p, max_new_tokens=16, device=cpu, use_cache=False) for p in prompts]
+    cached_outs = [generate_text(model, tok, p, max_new_tokens=16, device=cpu, use_cache=True) for p in prompts]
+    batch_outs = generate_batch_greedy(model, tok, prompts, max_new_tokens=16, device=cpu, batch_size=2)
+    assert cached_outs == uncached_outs, f"KV-cache greedy mismatch: {cached_outs!r} vs {uncached_outs!r}"
+    assert batch_outs == uncached_outs, f"Batched greedy mismatch: {batch_outs!r} vs {uncached_outs!r}"
+
+    # Verify exact context_length boundary (`len(prompt) + max_new_tokens == context_length`) works cleanly
+    exact_prompt = "x" * 20
+    boundary_out = generate_batch_greedy(model, tok, [exact_prompt], max_new_tokens=12, device=cpu, batch_size=1)
+    assert len(boundary_out) == 1
+
+
 if __name__ == "__main__":
     print("Running MiniReasoner test suite in tests/...")
     test_architecture_and_forward_backward()
@@ -228,4 +271,6 @@ if __name__ == "__main__":
     print("  [PASSED] Long context generation (> 256 tokens)")
     test_sampler_and_checkpoint_compatibility()
     print("  [PASSED] Sampler accounting and checkpoint round-trip")
+    test_kv_cache_and_batched_greedy_parity()
+    print("  [PASSED] KV-cache incremental decoding & batched greedy exact parity")
     print("All tests in tests/ passed successfully!")

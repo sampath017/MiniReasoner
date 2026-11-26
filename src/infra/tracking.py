@@ -180,8 +180,9 @@ def discover_azure_runs(
     *,
     experiment: str = MLFLOW_EXPERIMENT,
     preferred_stages: tuple[str, ...] | None = None,
+    preferred_arith_format: str | None = None,
 ) -> list[dict]:
-    """List checkpoint runs in Azure prioritized by active MLflow state, optional stage, and recency."""
+    """List checkpoint runs in Azure prioritized by active MLflow state, stage, format, and recency."""
     exp_prefix = experiment_checkpoint_prefix(experiment)
     run_pattern = re.compile(rf"^{re.escape(exp_prefix)}([A-Za-z0-9_-]+)/([^/]+)$")
     runs_info: dict[str, dict] = {}
@@ -200,6 +201,7 @@ def discover_azure_runs(
 
     mlflow_states: dict[str, str] = {}
     mlflow_stages: dict[str, str] = {}
+    mlflow_arith_formats: dict[str, str] = {}
     if os.getenv("DATABRICKS_HOST", "").strip() and os.getenv("DATABRICKS_TOKEN", "").strip():
         try:
             mlflow.set_tracking_uri("databricks")
@@ -208,11 +210,20 @@ def discover_azure_runs(
                 try:
                     run = ml_client.get_run(rid)
                     mlflow_states[rid] = str(run.info.lifecycle_stage).lower()
-                    mlflow_stages[rid] = str(run.data.tags.get("stage", "pretrain")).lower()
+                    stage_val = str(run.data.tags.get("stage", "pretrain")).lower()
+                    mlflow_stages[rid] = stage_val
+                    fmt_val = (
+                        run.data.tags.get("arith_format")
+                        or run.data.params.get("answer_format")
+                        or ("direct" if stage_val == "sft" else "")
+                    )
+                    mlflow_arith_formats[rid] = str(fmt_val).lower()
                 except Exception:
                     mlflow_states[rid] = "unknown"
         except Exception:
             pass
+
+    target_fmt = "scratchpad" if preferred_arith_format == "cot" else preferred_arith_format
 
     def sort_key(item):
         rid, info = item
@@ -221,8 +232,12 @@ def discover_azure_runs(
             stage_rank = 1 if mlflow_stages.get(rid, "pretrain") in preferred_stages else 0
         else:
             stage_rank = 1
+        if target_fmt is not None:
+            fmt_rank = 1 if mlflow_arith_formats.get(rid, "") == target_fmt else 0
+        else:
+            fmt_rank = 1
         ts = info["last_modified"].timestamp() if info["last_modified"] else 0.0
-        return (is_active, stage_rank, ts)
+        return (is_active, stage_rank, fmt_rank, ts)
 
     results = []
     for rid, info in sorted(runs_info.items(), key=sort_key, reverse=True):
@@ -230,6 +245,7 @@ def discover_azure_runs(
             "run_id": rid,
             "mlflow_state": mlflow_states.get(rid, "unverified"),
             "mlflow_stage": mlflow_stages.get(rid, "pretrain"),
+            "arith_format": mlflow_arith_formats.get(rid, ""),
             "blob_count": info["count"],
             "last_modified": info["last_modified"],
         })

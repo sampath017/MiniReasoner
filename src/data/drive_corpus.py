@@ -127,6 +127,8 @@ def reuse_tokenized(drive_data_root: str, directory: Path, settings: dict) -> di
 
 def load_raw_training_stories(
     drive_data_root: str, cache_dir: Path, dataset_name: str, train_files: str, token: str | None,
+    *,
+    sync_drive: bool = True,
 ):
     from datasets import Dataset, load_dataset
 
@@ -135,7 +137,7 @@ def load_raw_training_stories(
     source = directory / "train.parquet"
     marker = directory / "manifest.json"
     expected = {"dataset": dataset_name, "split": "train", "source_files": train_files}
-    saved, _ = _remote_state(remote)
+    saved = _remote_state(remote)[0] if sync_drive else None
     manifest = saved
     if manifest is None and marker.is_file() and source.is_file():
         manifest = json.loads(marker.read_bytes())
@@ -160,7 +162,8 @@ def load_raw_training_stories(
                 staged = Path(temporary) / marker.name
                 staged.write_bytes(manifest_bytes)
                 staged.replace(marker)
-        _publish(remote, directory, manifest, {source.name: digest})
+        if sync_drive:
+            _publish(remote, directory, manifest, {source.name: digest})
         return Dataset.from_parquet(str(source), cache_dir=str(cache_dir))
 
     print("Loading the published SimpleStories training shards...", flush=True)
@@ -176,7 +179,8 @@ def load_raw_training_stories(
         digest = sha256(parquet)
         manifest = {**expected, "sha256": digest}
         (stage / marker.name).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        _publish(remote, stage, manifest, {source.name: digest})
+        if sync_drive:
+            _publish(remote, stage, manifest, {source.name: digest})
         parquet.replace(source)
         (stage / marker.name).replace(marker)
     return dataset
