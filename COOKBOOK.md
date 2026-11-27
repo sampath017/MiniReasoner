@@ -194,13 +194,13 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 
 ---
 
-## Phase 6 · Final Release & Verification Checklist
+## Phase 6 · Final Release & Verification Checklist ([notebooks/phase6_final_release.ipynb](notebooks/phase6_final_release.ipynb))
 
 1. Freeze the winning model config, weights, `tokenizer_json`, prompt template, decoding settings, and verifier.
-2. Run **once** on:
-   - The **sealed arithmetic test set** (exact-match accuracy, valid-format rate, per-category breakdown, generalization to unseen wordings/lengths, failure inspection).
-   - The **published `SimpleStories` test split** (`test_loss`, `test_ppl`, `test_bpb`, `story_mc_acc`, and 5 canonical story prompts) to confirm zero catastrophic forgetting.
-3. Verify offline CPU loading and deterministic greedy generation in [notebooks/phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) & [notebooks/phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) (`configure_eval_device("cpu")`).
+2. Run **once** inside [notebooks/phase6_final_release.ipynb](notebooks/phase6_final_release.ipynb) across `CoT SFT` (`e57bf52b...` Step `10,000`), `GRPO RL best` (`486683da...` Step `100`), and `GRPO RL latest` (`486683da...` Step `300`) on:
+   - The **sealed arithmetic test set (`6,002` rows)** (`strict_trace=True`, exact-match accuracy, valid-format rate, per-category breakdown, paired `RL fixed / broke`, generalization to unseen wordings, failure inspection).
+   - The **published `SimpleStories` test split** (`test_loss`, `test_ppl`, `test_bpb`, `story_mc_acc`, and 5 canonical story prompts, anchored against `Base` Step `26,047`) to confirm zero catastrophic forgetting.
+3. Verify offline CPU loading and deterministic greedy generation (`configure_eval_device("auto")` / `"cpu"`).
 4. Record final release artifact URIs (Azure blob name + SHA-256, Databricks run ID + parent lineage, Google Drive corpus manifest) before pruning experimental checkpoints or deleting the GPU VM.
 
 ---

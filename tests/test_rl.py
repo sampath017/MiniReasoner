@@ -360,6 +360,51 @@ def test_hard_failure_mining_and_end_to_end_grpo():
             buf.seek(0)
             resumed_state = torch.load(buf, map_location="cpu", weights_only=True)["model"]
             assert any(not torch.equal(resumed_state[k], v) for k, v in sft_model.state_dict().items()), "Expected mixed rewards to update weights"
+    # Verify strict wording generalization + Phase 6 multi-model comparison & provenance helpers cleanly
+    from src.core.benchmark import compare_arithmetic_results, compare_simplestories_results, evaluate_wording_generalization
+    from src.infra.eval_setup import summarize_release_provenance
+
+    with tempfile.TemporaryDirectory() as p6_dir:
+        tmp_p6 = Path(p6_dir)
+        _, p6_splits, p6_manifest = prepare_arithmetic_dataset(
+            output_dir=tmp_p6 / "arith",
+            samples_per_op=100,
+            seed=42,
+            answer_format="scratchpad",
+            include_multistep=True,
+            sync_drive=False,
+        )
+        wording = evaluate_wording_generalization(
+            sft_model, tok, p6_splits["test"], device=torch.device("cpu"),
+            answer_format="scratchpad", n_problems=4, max_new_tokens=6, use_kv_cache=True, strict_trace=True,
+        )
+        assert "canonical" in wording
+        fake_rows_a = [
+            {"op": "add", "category": "add_2d", "prompt": "Q1", "expected": 2, "completion": "Work: 1+1=2\nAnswer: 2", "exact_match": True, "strict_pass": True},
+            {"op": "mul", "category": "mul_3d", "prompt": "Q2", "expected": 6, "completion": "bad", "exact_match": False, "strict_pass": False},
+        ]
+        fake_rows_b = [
+            {"op": "add", "category": "add_2d", "prompt": "Q1", "expected": 2, "completion": "bad", "exact_match": False, "strict_pass": False},
+            {"op": "mul", "category": "mul_3d", "prompt": "Q2", "expected": 6, "completion": "Work: 2*3=6\nAnswer: 6", "exact_match": True, "strict_pass": True},
+        ]
+        comp = compare_arithmetic_results(
+            {
+                "SFT": {"eval_loss": 0.01, "strict_pass": 0.5, "exact_match": 0.5, "valid_format": 1.0, "valid_work": 0.5, "op_stats": {"add": [1, 1], "mul": [0, 1]}, "rows": fake_rows_a},
+                "RL": {"eval_loss": 0.02, "strict_pass": 0.5, "exact_match": 0.5, "valid_format": 1.0, "valid_work": 0.5, "op_stats": {"add": [0, 1], "mul": [1, 1]}, "rows": fake_rows_b},
+            },
+            baseline_name="SFT",
+            max_examples_to_show=2,
+        )
+        assert comp["paired"]["RL"] == {"both_pass": 0, "fixed": 1, "broke": 1, "both_fail": 0, "net": 0, "op_deltas": {"add": (0, 1), "mul": (1, 0)}}
+        compare_simplestories_results({"Base": {"test_ce": 1.15, "test_ppl": 3.16, "test_bpb": 0.55, "story_mc_acc": 87.5}})
+        ckpt_file = tmp_p6 / "ckpt.pt"
+        ckpt_file.write_bytes(b"checkpoint-bytes")
+        prov = summarize_release_provenance(
+            [{"label": "SFT", "run_id": "run_sft", "checkpoint_path": ckpt_file, "bundle": {"stage": "sft", "step": 10000, "checkpoint": {"parent_run_id": "base", "parent_checkpoint_step": 26047}}}],
+            arith_dir=tmp_p6 / "arith",
+            arith_manifest=p6_manifest,
+        )
+        assert prov[0]["sha256"] == sha256(ckpt_file)
     print("  [PASSED] Hard-failure mining, strict GRPO training loop, Azure naming & resume")
 
 

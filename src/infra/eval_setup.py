@@ -87,7 +87,9 @@ def select_run_and_checkpoint(
         print(f"Using offline local checkpoint: {resolved}")
         return resolved.parent.name, resolved, None
 
-    if run_id is None:
+    if run_id is not None:
+        selected_run_id = run_id
+    else:
         discovered = discover_azure_runs(
             azure_container,
             experiment=experiment,
@@ -111,11 +113,19 @@ def select_run_and_checkpoint(
             f"\nAuto-selected run: {selected_run_id} "
             f"(stage={discovered[0]['mlflow_stage']}, format={discovered[0].get('arith_format') or '-'})"
         )
-    else:
-        selected_run_id = run_id
 
-    store = CheckpointStore(azure_container, selected_run_id, experiment=experiment)
-    versions = store._versions()
+    run_cache_dir = ckpt_root / selected_run_id
+    try:
+        store = CheckpointStore(azure_container, selected_run_id, experiment=experiment)
+        versions = store._versions()
+    except Exception as exc:
+        local_matches = sorted(run_cache_dir.glob(f"{checkpoint_alias}_step_*_*.pt"))
+        if local_matches:
+            fallback = local_matches[-1]
+            size_mb = fallback.stat().st_size / (1024 * 1024)
+            print(f"Azure lookup unavailable ({type(exc).__name__}); using local cached checkpoint: {fallback} ({size_mb:.2f} MB)")
+            return selected_run_id, fallback, None
+        raise
     if not versions:
         raise FileNotFoundError(f"No valid checkpoints found for run {selected_run_id!r} in {store.location}.")
 
@@ -148,7 +158,6 @@ def select_run_and_checkpoint(
             f"Val Loss: {latest_snap.val_loss:.4f} | Train Mean: {latest_snap.train_loss_interval_mean:.4f}"
         )
 
-    run_cache_dir = ckpt_root / selected_run_id
     run_cache_dir.mkdir(parents=True, exist_ok=True)
     cached_path = run_cache_dir / f"{checkpoint_alias}_step_{target_snap.step}_{target_snap.sha256[:8]}.pt"
     if not cached_path.is_file():
@@ -389,3 +398,62 @@ def plot_run_history(
         print(f"Story Val Loss:          {story_pts[0][1]:.4f} (Step {story_pts[0][0]:,}) -> {story_pts[-1][1]:.4f} (Step {story_pts[-1][0]:,})")
     if tps_vals:
         print(f"Mean Train Throughput:   {sum(tps_vals) / len(tps_vals):,.0f} tok/s")
+
+
+def summarize_release_provenance(
+    candidates: list[dict],
+    *,
+    arith_dir: Path | None = None,
+    arith_manifest: dict | None = None,
+    tokenized_dir: Path | None = None,
+) -> list[dict]:
+    """Compute SHA-256 checksums and print release artifact URIs across candidate checkpoints and datasets."""
+    from ..core.tokenizer import sha256
+    from ..settings import TOKENIZED_DATA_DIR
+    import json
+
+    rows: list[dict] = []
+    print("=" * 100)
+    print("PHASE 6 RELEASE ARTIFACT & LINEAGE PROVENANCE")
+    print("=" * 100)
+    print(f"{'Model Label':<26}{'Stage / Step':<18}{'Run ID':<34}{'Size (MB)':<11}{'SHA-256 (16)'}")
+    print("-" * 100)
+    for item in candidates:
+        label = item["label"]
+        run_id = item["run_id"]
+        path = Path(item["checkpoint_path"])
+        bundle = item["bundle"]
+        digest = sha256(path)
+        size_mb = path.stat().st_size / (1024 * 1024)
+        stage_step = f"{bundle['stage']} @ {bundle['step']:,}"
+        print(f"{label:<26}{stage_step:<18}{run_id:<34}{size_mb:<11.2f}{digest[:16]}")
+        rows.append({
+            "label": label,
+            "run_id": run_id,
+            "checkpoint_path": str(path),
+            "sha256": digest,
+            "size_mb": round(size_mb, 2),
+            "stage": bundle["stage"],
+            "step": bundle["step"],
+            "parent_run_id": bundle["checkpoint"].get("parent_run_id"),
+            "parent_checkpoint_step": bundle["checkpoint"].get("parent_checkpoint_step"),
+            "azure_uri": f"https://minireasoner.blob.core.windows.net/{AZURE_CONTAINER}/checkpoints/Shared/MiniReasoner/{run_id}",
+        })
+
+    if arith_dir is not None and arith_manifest is not None:
+        test_meta = (arith_manifest.get("files") or {}).get("test.jsonl") or {}
+        print("-" * 100)
+        print(
+            f"Sealed Arith Test: {arith_dir / 'test.jsonl'} | rows={test_meta.get('rows', '?'):,} | "
+            f"sha256={str(test_meta.get('sha256', '?'))[:16]}..."
+        )
+    tok_root = Path(tokenized_dir) if tokenized_dir is not None else TOKENIZED_DATA_DIR
+    tok_manifest_path = tok_root / "manifest.json"
+    if tok_manifest_path.is_file():
+        tok_manifest = json.loads(tok_manifest_path.read_text(encoding="utf-8"))
+        print(
+            f"Corpus Manifest:   {tok_manifest_path} | vocab={tok_manifest.get('vocab_size')} | "
+            f"tok_sha256={str(tok_manifest.get('tokenizer_sha256', '?'))[:16]}..."
+        )
+    print("=" * 100)
+    return rows
