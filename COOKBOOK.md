@@ -203,6 +203,15 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 3. Verify offline CPU loading and deterministic greedy generation (`configure_eval_device("auto")` / `"cpu"`).
 4. Record final release artifact URIs (Azure blob name + SHA-256, Databricks run ID + parent lineage, Google Drive corpus manifest) before pruning experimental checkpoints or deleting the GPU VM.
 
+### 6.1 Recorded Phase 5–6 Sealed Test Results (`6,002` Rows, `arith_v3`, A30 BF16)
+
+| Candidate | Run ID / Step | Strict Pass | Exact Match | Work Valid | Paired vs CoT SFT | `SimpleStories` Test (250 stories) |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| **Base** | `23a72f3a...` @ `26,047` | — | — | — | — | PPL **`3.12`** · BPB `0.5426` · Cloze `86.0%` |
+| **CoT SFT 🏆** | `e57bf52b...` @ `10,000` | **`97.35%`** (`5,843`) | **`97.42%`** (`5,847`) | `98.33%` | Baseline (`077e9ad1...`) | PPL **`3.31`** · BPB `0.5697` · Cloze `83.0%` |
+| **GRPO RL `best`** | `486683da...` @ `100` | `97.15%` (`5,831`) | `97.23%` (`5,836`) | `98.08%` | `fixed=56, broke=68` (`net=-12`) | PPL `3.32` · BPB `0.5708` · Cloze `83.0%` |
+| **GRPO RL `latest`** | `486683da...` @ `300` | `96.93%` (`5,818`) | `97.03%` (`5,824`) | `97.88%` | `fixed=58, broke=83` (`net=-25`) | PPL `3.32` · BPB `0.5709` · Cloze `83.0%` |
+
 ---
 
 ## Decision & Milestone Log
@@ -212,4 +221,4 @@ Before deleting any VM instance, also verify your local repo, remote `origin/mai
 | 25 Nov 2026 | Run `23a72f3a...` (`1,024` ctx, `RoPE`) finished 1 full epoch (`26,047` steps): best val **`1.1302`** at Step `25,000`, final **`1.1303`** at Step `26,047` | Promote `RoPE` `1,024`-ctx base model (extensible up to `2,048` for SFT); evaluate Step `25,000` vs `26,047` in `phase3_base_evaluation.ipynb` |
 | Phase 3 | Held-out SimpleStories test PPL/BPB, 4-choice Story Cloze accuracy, RoPE position-bucket scaling (`1–1,024`), and pre-SFT arithmetic baseline | Promoted `23a72f3a...` (`latest_step_26047_095810fa.pt`) into Phase 4 |
 | Phase 4 (26 Nov 2026) | Direct SFT (`ef3cc27c...`, 8k steps) hit `88.8%` (`89.6%` peak, `mul_3d=3/10`); Scratchpad + Multi-Step SFT (`e57bf52b...`, 10k steps) reached **`97.9%`** (`274/280`, `val_arith_loss=0.0022`, `story_val_loss=1.1796`) | Promote `e57bf52b...` (`sft_scratchpad` Step `10,000`) as Phase 5 GRPO RL reference checkpoint |
-| Phase 5–6 (Planned) | Paired GRPO vs. SFT val wins/regressions, sealed arithmetic test, final CPU load check | Select final release checkpoint and archive provenance |
+| Phase 5–6 (27 Nov 2026) | Mined `1,198` strict-verifier `train` failures (`236` canonicals); GRPO (`486683da...`) raised train reward to `0.6797` (Step `100`) and `1.0000` (Step `300`) with KL `0.0125`. On all `6,002` sealed test rows, **CoT SFT (`97.35%` strict / `97.42%` exact, `100%` wording gen, `3.31` Story PPL)** outperformed GRPO `best` (`97.15%`, `fixed=56 / broke=68`) and `latest` (`96.93%`, `fixed=58 / broke=83`) | **Ship `e57bf52b...` (`latest_step_10000_077e9ad1.pt`) as final release winner**; retain `486683da...` as negative-result RLVR reference (needs ~40% passing anchor replay + harder 4-digit headroom) |

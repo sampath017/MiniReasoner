@@ -1,140 +1,81 @@
 # MiniReasoner
 
-MiniReasoner is a decoder-only Transformer trained to predict the next token in English SimpleStories. It uses the full published training split, with approximately 99% of stories for training and 1% held out for validation (`2,094,643` train stories / `853,498,695` tokens; `21,053` val stories / `8,598,126` tokens). The byte-level BPE tokenizer learns only from training stories, uses a target vocabulary of 1,024 tokens, and keeps digits separate.
+A from-scratch **32.05M RoPE Transformer** in PyTorch exploring how pre-training, Direct vs. Scratchpad CoT SFT, incremental KV caching, and Strict-Trace GRPO (RLVR) behave on multi-step arithmetic while preserving English story fluency.
 
-- **Dataset Citation:** [SimpleStories/SimpleStories](https://huggingface.co/datasets/SimpleStories/SimpleStories) ([arXiv:2504.09184](https://arxiv.org/abs/2504.09184)) · Hugging Face snapshot commit SHA: `e63b8adc3b1a1bdc7cac5b500d150b71346b0628` (`2,115,696` source `train` rows)
+## How It Was Built (5 Phases)
 
-## Model and training settings
+1. **Phase 1 — Corpus & Tokenizer:** Trained a digit-isolated `1,024`-token BPE and packed `853.5M` `SimpleStories` tokens.
+2. **Phase 2 — Pre-Training:** Trained the `32.05M` RoPE Transformer from scratch for 1 epoch (`26,047` steps).
+3. **Phase 3 — Base Evaluation:** Benchmarked held-out story fluency (`3.12` PPL, `86.0%` Story Cloze) and the `0%` zero-shot math baseline.
+4. **Phase 4 — Arithmetic SFT & KV Cache:** Fine-tuned Direct vs. CoT Scratchpad (`Work:` + `Answer:`) models with `10%` story replay and added exact-parity KV caching (`4.51x` CPU speedup).
+5. **Phase 5 — Strict-Trace GRPO (RLVR):** Trained GRPO with a binary AST trace verifier on `1,198` mined failures before the final Phase 6 sealed evaluation.
 
-Choose `base` or `small` via `--preset` when launching training (defaults to `base`). Parameter counts assume a 1,024-token vocabulary and count the shared input embedding and output weights once. [Preset definitions](src/settings.py)
+## Results at a Glance
 
-| Setting                            |   Base (default) |          Small |
-| ---------------------------------- | ---------------: | -------------: |
-| Trainable parameters               |       32,049,152 |        165,632 |
-| Positional embeddings              |  RoPE (θ = 10,000)|  RoPE (θ = 10,000)|
-| Transformer blocks                 |               10 |              2 |
-| Attention heads                    |                8 |              4 |
-| Embedding dimension                |              512 |             64 |
-| Context length (tokens per window) |            1,024 |             64 |
-| Batch size (windows per step)      |               32 |             32 |
-| Prediction targets per full step   |           32,768 |          2,048 |
-| Training duration                  | 1 epoch (~26,047)|       60 steps |
-| Learning rate (peak → minimum)     |0.00065 → 0.000065| 0.001 → 0.0001 |
-| Warmup steps                       |              700 |              5 |
-| Validation interval                |        500 steps |       20 steps |
+Evaluated on held-out `SimpleStories` test stories (`250` stories / `101,970` tokens) and the **single-shot sealed `arith_v3` test split (`6,002` rows)** after all training completed:
 
-Both presets train on the VM's CUDA GPU using AdamW with weight decay 0.1 and Rotary Positional Embeddings (RoPE). Training uses BF16 on modern GPUs (e.g. NVIDIA A30) and FP32 otherwise.
+| Stage / Checkpoint                       | Run ID     | Arithmetic Accuracy                                  | `SimpleStories` Test                          | Key Outcome                                       |
+| ---------------------------------------- | ---------- | ---------------------------------------------------- | --------------------------------------------- | ------------------------------------------------- |
+| **Base** (26,047 steps)                  | `23a72f3a` | `0.0%` (`0/10` zero-shot)                            | **PPL `3.12`** · BPB `0.5426` · Cloze `86.0%` | 1 epoch over `853.5M` tokens                      |
+| **Direct SFT** (8,000 steps)             | `ef3cc27c` | `88.8%` val (`213/240`)                              | `1.2021` story val loss                       | Bottlenecked on `mul_3d` (`3/10`)                 |
+| **CoT Scratchpad SFT** (10,000 steps) 🏆 | `e57bf52b` | **`97.35%` strict / `97.42%` exact** (`5,843/6,002`) | **PPL `3.31`** · BPB `0.5697` · Cloze `83.0%` | **Release winner** · `100.0%` wording gen         |
+| **GRPO RL `best`** (Step 100)            | `486683da` | `97.15%` strict / `97.23%` exact (`5,831/6,002`)     | **PPL `3.32`** · BPB `0.5708` · Cloze `83.0%` | `fixed=56, broke=68` (`net=-12`) · `sub` `99.92%` |
+| **GRPO RL `latest`** (Step 300)          | `486683da` | `96.93%` strict / `97.03%` exact (`5,818/6,002`)     | **PPL `3.32`** · BPB `0.5709` · Cloze `83.0%` | Train reward `1.0000` · `fixed=58, broke=83`      |
 
-The base preset trains a 32M RoPE model from scratch for 1 epoch (~26,047 steps at 32,768 tokens/step) on the ~853.5M-token SimpleStories training corpus. The small preset starts a fresh 60-step run.
+![MiniReasoner Phase 6 Final Release Verification](assets/phase6_release_comparison.png)
 
-## Loss metrics
+## Key Takeaways
 
-The training CLI prints the current batch loss at every step (4 decimal digits, `.4f`) and mirrors each run's full output to its own file under `logs/`. At each validation check it also prints the interval's mean training loss beside validation loss. MLflow records all three against the optimizer step.
+- **Scratchpad CoT eliminates the multiplication bottleneck:** Decomposing 3-digit math and PEMDAS/word problems into place-value `Work:` steps lifted arithmetic from `88.8%` val (`mul_3d = 30%`) to `97.42%` exact on `6,002` sealed test rows, while `10%` story replay kept `SimpleStories` PPL at `3.31` (vs. `3.12` base).
+- **Clean systems & leakage hygiene:** Digit-isolated `1,024`-vocab byte BPE (`SimpleStories`), FP32 RoPE rotations (`10L / 8H / 512D`, `1,024` context), canonical deduplication before `train/val/test` splits (no `7+8`/`8+7` leakage), `-100` prompt masking, and incremental KV caching with equal-length batching (`4.51x` CPU speedup, exact greedy parity).
+- **Strict binary AST verifier (`{0.0, 1.0}`):** Rejects missing `<|eos|>`, bad formatting, tautologies, or any invalid `Work:` equation—catching "lucky-answer hallucinations" where exact match alone passes broken reasoning (e.g., `Work: 39*10=390; 702-390=212; 39*8=212; 10+8=18 // Answer: 18`).
+- **Why CoT SFT shipped over GRPO:** Failure-only mining yielded `1,198` `train` rows from `236` failed canonicals (`83%` `div`/`multi`). GRPO drove hard-train reward from `0.5469` (Step 50) to `1.0000` (Step 300) with low KL (`0.0125`), lifting `sub` to `99.92%`, yet over-decomposed 1-step divisions (e.g., `990/33=30`) without passing-problem anchor replay (`fixed=56, broke=68`).
 
-| MLflow metric              | What it measures                                                                                                                                   |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `train_loss`               | Next-token cross-entropy for the current training batch.                                                                                           |
-| `val_loss`                 | Mean cross-entropy over a fresh random sample of the packed validation targets (`eval_token_fraction`). Measured at step 0, each validation interval, and the stopping step. |
-| `train_loss_interval_mean` | Mean training loss since the previous check, weighted by the number of prediction targets.                                                         |
+## Training Progression
 
-## Start a run on the VM
+|              Base Pre-Training (`853.5M` tokens)               |         CoT Scratchpad SFT (`arith_v3` + 10% replay)          |
+| :------------------------------------------------------------: | :-----------------------------------------------------------: |
+| ![Base Pre-Training Curves](assets/phase3_pretrain_curves.png) | ![CoT SFT Training Curves](assets/phase4b_cot_sft_curves.png) |
 
-Run both presets on a CUDA VM. On JarvisLabs, run the [setup script](scripts/jarvis_labs.sh) from your MiniReasoner checkout.
+## Architecture & Setup
 
-```bash
-bash scripts/jarvis_labs.sh
-```
-
-For a fresh VM, download the script and run it to clone the project into `/home/MiniReasoner`, install `nvtop`, and sync the locked Python environment.
+- **Model (`PRESETS["base"]` in [src/settings.py](src/settings.py)):** `32,049,152` params, `10` layers, `8` heads (`head_dim = 64`), `n_embd = 512`, `RoPE` (`theta = 10,000`), `1,024` context window, `1,024`-token digit-isolated BPE.
+- **Corpus:** [`SimpleStories/SimpleStories`](https://huggingface.co/datasets/SimpleStories/SimpleStories) ([arXiv:2504.09184](https://arxiv.org/abs/2504.09184), snapshot `e63b8adc3b1a1bdc7cac5b500d150b71346b0628`), split 99/1 (`2,094,643` train / `21,053` val stories).
+- **Environment:** Copy [.env.example](.env.example) to `.env` for Azure Blob checkpoints (`minireasoner`), Databricks MLflow (`/Shared/MiniReasoner`), and optional `RCLONE_CONFIG_BASE64` (`gdrive:MiniReasoner/data`). On a fresh CUDA VM:
 
 ```bash
 curl -fsSLo /tmp/jarvis_labs.sh https://raw.githubusercontent.com/sampath017/MiniReasoner/main/scripts/jarvis_labs.sh
 bash /tmp/jarvis_labs.sh
 ```
 
-Use an existing private **Azure Blob Storage** container named `minireasoner` (or change `AZURE_CONTAINER` in `src/settings.py`). Hot storage with locally redundant storage (LRS) suits frequently restored checkpoints. Give the VM access to read, list, and write blobs. Deleting blobs is needed only if you enable checkpoint pruning.
+## Quickstart CLI & Notebooks
 
-Fill in the entries in the project-root `.env` from [.env.example](.env.example).
-
-| Variable | Value |
-| --- | --- |
-| `AZURE_STORAGE_CONNECTION_STRING` | Connection string for the account containing the private checkpoint container |
-| `DATABRICKS_HOST` | HTTPS workspace URL |
-| `DATABRICKS_TOKEN` | Workspace token with permission to log runs under `/Shared/MiniReasoner` |
-| `RCLONE_CONFIG_BASE64` | Base64-encoded `rclone.conf` for unattended `gdrive:` access (optional if `rclone` is already configured) |
-
-For container-scoped access, generate a SAS on the `minireasoner` container with Read, Write, and List permissions and HTTPS only. Set `AZURE_STORAGE_CONNECTION_STRING` to `BlobEndpoint=https://<account>.blob.core.windows.net;SharedAccessSignature=<token>`. Use the token text without its leading question mark. Enable Delete only if the VM will prune checkpoints. [Azure SAS connection strings](https://learn.microsoft.com/en-us/azure/storage/common/storage-configure-connection-string#create-a-connection-string-using-a-shared-access-signature)
-
-### Headless background training via `tmux` (survives terminal disconnects)
-
-To start long-running training inside a detached `tmux` session (`train`) that keeps running when you close your SSH terminal, browser, or laptop:
+All training runs launch detached inside `tmux` via [scripts/train.sh](scripts/train.sh) with per-run logs in `logs/`:
 
 ```bash
-# Start training in tmux and attach immediately (Ctrl+B, then D to detach)
+# 1. Pre-train base model (1 epoch, ~26,047 steps on A30 BF16)
 bash scripts/train.sh --preset base
 
-# Re-attach to the running tmux session
-bash scripts/train.sh attach
+# 2. Prepare SFT data & run CoT Scratchpad SFT (10k steps)
+bash scripts/prepare_data.sh --format cot --multistep
+bash scripts/train.sh sft --preset sft_scratchpad
 
-# Monitor status, GPU stats, and recent log lines
-bash scripts/train.sh status
+# 3. Mine strict-verifier failures & run GRPO RL (300 steps)
+bash scripts/prepare_data.sh --stage rl
+bash scripts/train.sh grpo --preset grpo
 
-# Stream live training logs without attaching to tmux
-bash scripts/train.sh logs
-
-# Stop gracefully when needed (saves checkpoint to Azure before exiting)
-bash scripts/train.sh stop
+# Monitor / attach / stop cleanly / prune deleted MLflow blobs
+bash scripts/train.sh status   # or: attach | logs | stop
+uv run python src/main.py cleanup [--delete]
 ```
 
-You can also run [src/main.py](src/main.py) directly:
-```bash
-python src/main.py --preset base
-# Or resume an existing run:
-python src/main.py --preset base --resume --run-id <MLFLOW_RUN_ID>
-```
+Evaluate locally on CPU or CUDA via `notebooks/`:
 
-### Phase-by-Phase Evaluation Notebooks
-Use the compartmentalized evaluation notebooks under `notebooks/` (backed by shared helpers in `src/infra/eval_setup.py` and `src/core/benchmark.py`):
-- [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) — Phase 3 Base Model Evaluation (`32.05M` RoPE architecture & convergence curves, `SimpleStories` test PPL/BPB, Story Cloze `story_mc_acc`, RoPE position scaling, pre-SFT arithmetic baseline, throughput)
-- [phase4a_sft_direct.ipynb](notebooks/phase4a_sft_direct.ipynb) — Phase 4a Direct SFT (`arith_v2`, `Answer: <int>`)
-- [phase4b_sft_cot.ipynb](notebooks/phase4b_sft_cot.ipynb) — Phase 4b CoT Scratchpad + Multi-Step SFT (`arith_v3`, `Work: ... \nAnswer: <int>`)
-- [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) — Phase 4c CoT SFT with KV Cache (parity/speedup benchmark, full `6,002`-row `val` evaluation, fast local `ask_math` / `ask` playground)
-- [phase5_grpo_rl.ipynb](notebooks/phase5_grpo_rl.ipynb) — Phase 5 Verifiable-Reward GRPO RL (strict binary `{0, 1}` trace verifier, paired `RL vs CoT SFT` evaluation)
-- [phase6_final_release.ipynb](notebooks/phase6_final_release.ipynb) — Phase 6 Final Release & Sealed Test Verification (`Base` vs `CoT SFT` vs `GRPO RL best/latest` across all `6,002` sealed `test.jsonl` rows, wording generalization, `SimpleStories` test retention, and artifact provenance)
+- [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) — Base `SimpleStories` PPL/BPB, Story Cloze, RoPE scaling & 0-shot math baseline
+- [phase4a_sft_direct.ipynb](notebooks/phase4a_sft_direct.ipynb) — Direct SFT (`arith_v2`, `88.8%` val)
+- [phase4b_sft_cot.ipynb](notebooks/phase4b_sft_cot.ipynb) — CoT Scratchpad + Multi-Step SFT (`arith_v3`)
+- [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb) — KV-cache parity/speedup (`4.51x` CPU) & full `6,002`-row `val` eval
+- [phase5_grpo_rl.ipynb](notebooks/phase5_grpo_rl.ipynb) — Strict-trace GRPO RL evaluation
+- [phase6_final_release.ipynb](notebooks/phase6_final_release.ipynb) — Final single-shot sealed `test.jsonl` (`6,002` rows) comparison & provenance
 
-Note: Phase 1 data preparation, Phase 2/4 training, and Phase 5 GRPO mining/training run via `bash scripts/prepare_data.sh` and `bash scripts/train.sh`; notebooks are strictly for evaluation and interactive testing.
-
-See [COOKBOOK.md](COOKBOOK.md) for the complete end-to-end build, training, post-training SFT/RL, and release plan.
-
-## Reuse the corpus and save checkpoints
-
-Jarvis setup installs `tmux` and checks that it can list Google Drive using the `gdrive` connection before it reports ready. When `RCLONE_CONFIG_BASE64` is present in `.env`, `scripts/jarvis_labs.sh` configures `gdrive:` automatically with no interactive prompts. Otherwise, run setup in a VM terminal and authorize Google Drive interactively. [Google OAuth client setup](https://rclone.org/drive/#making-your-own-client-id) · [rclone remote setup](https://rclone.org/remote_setup/)
-
-| Location | Contents |
-| --- | --- |
-| Google Drive · `My Drive/MiniReasoner/data/raw/` | SimpleStories training text saved during fresh preparation |
-| Google Drive · `My Drive/MiniReasoner/data/tokenized/full-val-0.01/` | Tokenizer, packed training and validation tokens, and their manifest |
-| Google Drive · `My Drive/MiniReasoner/data/sft/` | Prepared Phase 4 arithmetic SFT `train`/`val`/`test` splits and checksum manifests |
-| Azure · `minireasoner/checkpoints/Shared/MiniReasoner/<run-id>/` | Checkpoints (`step-*.pt`) and run logs (`logs/train_<TIMESTAMP>_<PRESET>.log`) |
-| Databricks · `/Shared/MiniReasoner` | Per-run curves, settings, `logs/` artifacts, and Azure checkpoint/log tags |
-| Local VM · `logs/` | One local log per run (`logs/train_<TIMESTAMP>_<PRESET>.log`, no local aliases) |
-
-A fresh VM downloads the prepared corpus from Drive and verifies its file sizes and checksums before training. An existing folder with `manifest.json`, `tokenizer.json`, `train.bin`, and `val.bin` works directly when its manifest matches the corpus settings. The VM reads training batches from its disk cache. If preparation is needed, it reuses raw training stories from Drive or fetches them from Hugging Face, fits BPE on the training portion, and saves the finished corpus to Drive.
-
-Uploads run in the background after validation. The training runner waits for pending uploads on completion or `SIGINT`/`SIGTERM`. `CHECKPOINT_LIMIT = None` keeps every checkpoint. To resume on a GPU VM, pass `--resume --run-id <MLFLOW_RUN_ID>` to `bash scripts/train.sh` or `python src/main.py` using the same storage container, experiment path, corpus, and training settings.
-
-When the run is complete, open the corresponding phase notebook under `notebooks/` (e.g. [phase3_base_evaluation.ipynb](notebooks/phase3_base_evaluation.ipynb) or [phase4c_sft_kv_cache.ipynb](notebooks/phase4c_sft_kv_cache.ipynb)) with the project's `.venv` kernel (on either a local CPU machine or a CUDA GPU VM) to auto-select checkpoints from Azure, inspect metrics, and run inference benchmarks.
-
-To remove Azure checkpoints for runs you deleted in the Databricks MLflow UI:
-
-```bash
-# Safe dry-run preview (lists active, deleted, and missing runs)
-uv run python src/main.py cleanup
-
-# Delete orphaned Azure blobs for runs deleted in Databricks MLflow
-uv run python src/main.py cleanup --delete
-```
-
-## CPU inference
-
-Open any phase notebook in `notebooks/` on your local machine (it automatically detects CPU vs CUDA). Leave `RUN_ID = None` to auto-select the newest matching run for that phase, set `RUN_ID = "<MLFLOW_RUN_ID>"`, or set `LOCAL_CHECKPOINT` to a downloaded `.pt` file for offline inference. You can also call `src.core.generate.complete()` directly from Python.
+See [COOKBOOK.md](COOKBOOK.md) for the complete phase-by-phase build playbook and run logs.
